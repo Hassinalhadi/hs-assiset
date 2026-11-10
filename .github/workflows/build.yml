@@ -625,13 +625,12 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK Platform 36
+      - name: Accept Android SDK Licenses
+        shell: bash
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" || sdkmanager "platforms;android-36.1" "build-tools;36.0.0" || true
+          SDKMANAGER=$(find "$ANDROID_HOME" /usr/local/lib/android/sdk -name sdkmanager 2>/dev/null | sort -V | tail -n 1)
+          echo "Using sdkmanager at: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
