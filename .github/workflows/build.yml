@@ -1,0 +1,660 @@
+name: Inject Features & Build Android APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Inject Log Catcher, HungerStation Scope & UI into Project
+        shell: bash
+        run: |
+          set -e
+          mkdir -p app/src/main/java/io/github/khalil212002/unmockgps
+          mkdir -p app/src/main/res/layout
+          mkdir -p app/src/main/res/values
+
+          # 1. كتابة كود الموديول UnMockGPS.kt (حصر الحزمة + صائد السجلات + البث للواجهة)
+          cat << 'EOF' > app/src/main/java/io/github/khalil212002/unmockgps/UnMockGPS.kt
+          package io.github.khalil212002.unmockgps
+
+          import android.app.AndroidAppHelper
+          import android.content.Intent
+          import android.location.Location
+          import android.os.Bundle
+          import android.util.Log
+          import de.robv.android.xposed.IXposedHookLoadPackage
+          import de.robv.android.xposed.XC_MethodHook
+          import de.robv.android.xposed.XposedBridge
+          import de.robv.android.xposed.XposedHelpers
+          import de.robv.android.xposed.callbacks.XC_LoadPackage
+          import java.io.File
+          import java.io.FileWriter
+          import java.io.PrintWriter
+          import java.io.StringWriter
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class UnMockGPS : IXposedHookLoadPackage {
+
+              companion object {
+                  const val TARGET_PACKAGE = "com.logistics.rider.hungerstation"
+                  const val MODULE_PACKAGE = "io.github.khalil212002.unmockgps"
+                  const val MODULE_TAG = "HS_UnmockGPS"
+                  const val LOG_FILE_NAME = "hs_caught_logs.log"
+                  const val ACTION_LOG_ENTRY = "io.github.khalil212002.unmockgps.ACTION_LOG_ENTRY"
+                  const val EXTRA_LOG_LINE = "extra_log_line"
+              }
+
+              private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+
+              override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
+                  // حصر العمل على حزمة تطبيق هنقرستيشن للمندوب فقط
+                  if (lpparam.packageName != TARGET_PACKAGE) {
+                      return
+                  }
+
+                  captureLog("INFO", MODULE_TAG, "تم اعتراض وتفعيل الموديول داخل الحزمة: ${lpparam.packageName} (العملية: ${lpparam.processName})")
+
+                  // 1. تفعيل ميزة صيد السجلات (Log Catcher)
+                  setupLogCatcher(lpparam)
+
+                  // 2. تفعيل تجاوز كشف الموقع الوهمي (Mock Location Bypass)
+                  setupLocationHooks(lpparam)
+              }
+
+              private fun setupLocationHooks(lpparam: XC_LoadPackage.LoadPackageParam) {
+                  try {
+                      val locationClass = Location::class.java.name
+
+                      // إخفاء علامة الموقع الوهمي isMock
+                      XposedHelpers.findAndHookMethod(locationClass, lpparam.classLoader, "isMock", object : XC_MethodHook() {
+                          override fun afterHookedMethod(param: MethodHookParam) {
+                              val original = param.result as? Boolean ?: false
+                              param.result = false
+                              if (original) {
+                                  captureLog("HOOK", MODULE_TAG, "Location.isMock() تم اعتراضها وتغييرها من true إلى false")
+                              }
+                          }
+                      })
+
+                      // إخفاء علامة المزود الوهمي isFromMockProvider
+                      XposedHelpers.findAndHookMethod(locationClass, lpparam.classLoader, "isFromMockProvider", object : XC_MethodHook() {
+                          override fun afterHookedMethod(param: MethodHookParam) {
+                              val original = param.result as? Boolean ?: false
+                              param.result = false
+                              if (original) {
+                                  captureLog("HOOK", MODULE_TAG, "Location.isFromMockProvider() تم اعتراضها وتغييرها من true إلى false")
+                              }
+                          }
+                      })
+
+                      // حقن دقة موقع واقعية (5 أمتار)
+                      XposedHelpers.findAndHookMethod(locationClass, lpparam.classLoader, "getAccuracy", object : XC_MethodHook() {
+                          override fun afterHookedMethod(param: MethodHookParam) {
+                              param.result = 5.0f
+                          }
+                      })
+
+                      XposedHelpers.findAndHookMethod(locationClass, lpparam.classLoader, "hasAccuracy", object : XC_MethodHook() {
+                          override fun afterHookedMethod(param: MethodHookParam) {
+                              param.result = true
+                          }
+                      })
+
+                      // حقن ارتفاع واقعي (35 متر)
+                      XposedHelpers.findAndHookMethod(locationClass, lpparam.classLoader, "getAltitude", object : XC_MethodHook() {
+                          override fun afterHookedMethod(param: MethodHookParam) {
+                              param.result = 35.0
+                          }
+                      })
+
+                      XposedHelpers.findAndHookMethod(locationClass, lpparam.classLoader, "hasAltitude", object : XC_MethodHook() {
+                          override fun afterHookedMethod(param: MethodHookParam) {
+                              param.result = true
+                          }
+                      })
+
+                      // تنظيف حزمة Extras من أي إشارات تدل على تطبيقات تغيير الموقع
+                      XposedHelpers.findAndHookMethod(locationClass, lpparam.classLoader, "getExtras", object : XC_MethodHook() {
+                          override fun afterHookedMethod(param: MethodHookParam) {
+                              val extras = param.result as? Bundle
+                              if (extras != null && extras.containsKey("mockLocation")) {
+                                  extras.remove("mockLocation")
+                                  param.result = extras
+                                  captureLog("HOOK", MODULE_TAG, "Location.getExtras() تم حذف مفتاح mockLocation من الـ Bundle")
+                              }
+                          }
+                      })
+
+                      captureLog("INFO", MODULE_TAG, "تم تفعيل كافة خطافات الموقع (Location Hooks) بنجاح")
+                  } catch (e: Throwable) {
+                      captureLog("ERROR", MODULE_TAG, "فشل في تفعيل خطافات الموقع: ${e.message}", e)
+                  }
+              }
+
+              private fun setupLogCatcher(lpparam: XC_LoadPackage.LoadPackageParam) {
+                  try {
+                      val logClass = Log::class.java
+
+                      val logLevels = mapOf(
+                          "v" to "VERBOSE",
+                          "d" to "DEBUG",
+                          "i" to "INFO",
+                          "w" to "WARN",
+                          "e" to "ERROR",
+                          "wtf" to "WTF"
+                      )
+
+                      for ((methodName, levelName) in logLevels) {
+                          XposedHelpers.findAndHookMethod(
+                              logClass,
+                              methodName,
+                              String::class.java,
+                              String::class.java,
+                              object : XC_MethodHook() {
+                                  override fun beforeHookedMethod(param: MethodHookParam) {
+                                      val tag = param.args[0] as? String ?: "NULL_TAG"
+                                      val msg = param.args[1] as? String ?: ""
+                                      if (tag != MODULE_TAG) {
+                                          captureLog(levelName, tag, msg)
+                                      }
+                                  }
+                              }
+                          )
+
+                          XposedHelpers.findAndHookMethod(
+                              logClass,
+                              methodName,
+                              String::class.java,
+                              String::class.java,
+                              Throwable::class.java,
+                              object : XC_MethodHook() {
+                                  override fun beforeHookedMethod(param: MethodHookParam) {
+                                      val tag = param.args[0] as? String ?: "NULL_TAG"
+                                      val msg = param.args[1] as? String ?: ""
+                                      val tr = param.args[2] as? Throwable
+                                      if (tag != MODULE_TAG) {
+                                          captureLog(levelName, tag, msg, tr)
+                                      }
+                                  }
+                              }
+                          )
+                      }
+
+                      // صيد Log.println(int priority, String tag, String msg)
+                      XposedHelpers.findAndHookMethod(
+                          logClass,
+                          "println",
+                          Int::class.javaPrimitiveType,
+                          String::class.java,
+                          String::class.java,
+                          object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  val priority = param.args[0] as? Int ?: Log.INFO
+                                  val tag = param.args[1] as? String ?: "NULL_TAG"
+                                  val msg = param.args[2] as? String ?: ""
+                                  if (tag != MODULE_TAG) {
+                                      val levelName = priorityToName(priority)
+                                      captureLog(levelName, tag, msg)
+                                  }
+                              }
+                          }
+                      )
+
+                      // صيد الاستثناءات غير المعالجة (Uncaught Exceptions)
+                      XposedHelpers.findAndHookMethod(
+                          Thread::class.java,
+                          "dispatchUncaughtException",
+                          Throwable::class.java,
+                          object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  val tr = param.args[0] as? Throwable
+                                  captureLog("CRASH", "UncaughtException", "انهيار غير معالج في التطبيق", tr)
+                              }
+                          }
+                      )
+
+                      captureLog("INFO", MODULE_TAG, "تم تفعيل صائد السجلات (Log Catcher) بنجاح")
+                  } catch (e: Throwable) {
+                      XposedBridge.log("$MODULE_TAG: Failed to setup log catcher: ${e.message}")
+                  }
+              }
+
+              private fun priorityToName(priority: Int): String {
+                  return when (priority) {
+                      Log.VERBOSE -> "VERBOSE"
+                      Log.DEBUG -> "DEBUG"
+                      Log.INFO -> "INFO"
+                      Log.WARN -> "WARN"
+                      Log.ERROR -> "ERROR"
+                      Log.ASSERT -> "ASSERT"
+                      else -> "LOG($priority)"
+                  }
+              }
+
+              @Synchronized
+              private fun captureLog(level: String, tag: String, message: String, throwable: Throwable? = null) {
+                  try {
+                      val timestamp = dateFormat.format(Date())
+                      val sb = StringBuilder()
+                      sb.append("[$timestamp] [$level/$tag]: $message")
+                      if (throwable != null) {
+                          val sw = StringWriter()
+                          throwable.printStackTrace(PrintWriter(sw))
+                          sb.append("\n").append(sw.toString().trimEnd())
+                      }
+                      val formattedLine = sb.toString()
+
+                      XposedBridge.log("$MODULE_TAG | $formattedLine")
+                      sendLogBroadcast(formattedLine)
+                      writeLogToFile(formattedLine)
+                  } catch (_: Throwable) {
+                  }
+              }
+
+              private fun sendLogBroadcast(logLine: String) {
+                  try {
+                      val app = AndroidAppHelper.currentApplication() ?: return
+                      val intent = Intent(ACTION_LOG_ENTRY).apply {
+                          setPackage(MODULE_PACKAGE)
+                          putExtra(EXTRA_LOG_LINE, logLine)
+                      }
+                      app.sendBroadcast(intent)
+                  } catch (_: Throwable) {
+                  }
+              }
+
+              private fun writeLogToFile(logLine: String) {
+                  val candidateDirs = listOf(
+                      File("/sdcard/Download"),
+                      File("/sdcard/Documents"),
+                      File("/sdcard/Android/data/$TARGET_PACKAGE/files"),
+                      File("/data/data/$TARGET_PACKAGE/files"),
+                      File("/data/user/0/$TARGET_PACKAGE/files")
+                  )
+
+                  for (dir in candidateDirs) {
+                      try {
+                          if (!dir.exists()) {
+                              dir.mkdirs()
+                          }
+                          if (dir.exists() && dir.canWrite()) {
+                              val logFile = File(dir, LOG_FILE_NAME)
+                              FileWriter(logFile, true).use { writer ->
+                                  writer.append(logLine).append("\n")
+                              }
+                              break
+                          }
+                      } catch (_: Throwable) {
+                      }
+                  }
+              }
+          }
+          EOF
+
+          # 2. كتابة واجهة المستخدم MainActivity.kt (عرض السجل + زر Copy Log + تحديث ومسح)
+          cat << 'EOF' > app/src/main/java/io/github/khalil212002/unmockgps/MainActivity.kt
+          package io.github.khalil212002.unmockgps
+
+          import android.content.BroadcastReceiver
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.View
+          import android.widget.Button
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import java.io.File
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var tvStatus: TextView
+              private lateinit var tvLogContent: TextView
+              private lateinit var scrollViewLogs: ScrollView
+              private lateinit var btnCopyLog: Button
+              private lateinit var btnRefreshLog: Button
+              private lateinit var btnClearLog: Button
+
+              private val logBuilder = StringBuilder()
+
+              private val logReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      if (intent?.action == UnMockGPS.ACTION_LOG_ENTRY) {
+                          val line = intent.getStringExtra(UnMockGPS.EXTRA_LOG_LINE) ?: return
+                          appendLogLine(line)
+                      }
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+
+                  tvStatus = findViewById(R.id.tvStatus)
+                  tvLogContent = findViewById(R.id.tvLogContent)
+                  scrollViewLogs = findViewById(R.id.scrollViewLogs)
+                  btnCopyLog = findViewById(R.id.btnCopyLog)
+                  btnRefreshLog = findViewById(R.id.btnRefreshLog)
+                  btnClearLog = findViewById(R.id.btnClearLog)
+
+                  tvStatus.text = "الحزمة المستهدفة: ${UnMockGPS.TARGET_PACKAGE}"
+
+                  btnCopyLog.setOnClickListener {
+                      val currentLogs = tvLogContent.text.toString()
+                      if (currentLogs.isBlank() || currentLogs == getString(R.string.no_logs_yet)) {
+                          Toast.makeText(this, "لا يوجد سجل لنسخه حالياً", Toast.LENGTH_SHORT).show()
+                          return@setOnClickListener
+                      }
+                      val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                      val clip = ClipData.newPlainText("HS_Caught_Logs", currentLogs)
+                      clipboard.setPrimaryClip(clip)
+                      Toast.makeText(this, "تم نسخ السجل إلى الحافظة بنجاح!", Toast.LENGTH_SHORT).show()
+                  }
+
+                  btnRefreshLog.setOnClickListener {
+                      loadLogsFromDisk()
+                      Toast.makeText(this, "تم تحديث السجل", Toast.LENGTH_SHORT).show()
+                  }
+
+                  btnClearLog.setOnClickListener {
+                      clearLogs()
+                  }
+
+                  registerLogReceiver()
+                  loadLogsFromDisk()
+              }
+
+              private fun registerLogReceiver() {
+                  val filter = IntentFilter(UnMockGPS.ACTION_LOG_ENTRY)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      registerReceiver(logReceiver, filter, Context.RECEIVER_EXPORTED)
+                  } else {
+                      registerReceiver(logReceiver, filter)
+                  }
+              }
+
+              private fun appendLogLine(line: String) {
+                  if (logBuilder.isNotEmpty()) {
+                      logBuilder.append("\n")
+                  }
+                  logBuilder.append(line)
+                  tvLogContent.text = logBuilder.toString()
+                  scrollViewLogs.post {
+                      scrollViewLogs.fullScroll(View.FOCUS_DOWN)
+                  }
+
+                  try {
+                      val internalLog = File(filesDir, UnMockGPS.LOG_FILE_NAME)
+                      internalLog.appendText("$line\n")
+                  } catch (_: Throwable) {
+                  }
+              }
+
+              private fun getCandidateLogFiles(): List<File> {
+                  return listOf(
+                      File(filesDir, UnMockGPS.LOG_FILE_NAME),
+                      File("/sdcard/Download/${UnMockGPS.LOG_FILE_NAME}"),
+                      File("/sdcard/Documents/${UnMockGPS.LOG_FILE_NAME}"),
+                      File("/sdcard/Android/data/${UnMockGPS.TARGET_PACKAGE}/files/${UnMockGPS.LOG_FILE_NAME}"),
+                      File("/data/data/${UnMockGPS.TARGET_PACKAGE}/files/${UnMockGPS.LOG_FILE_NAME}"),
+                      File("/data/user/0/${UnMockGPS.TARGET_PACKAGE}/files/${UnMockGPS.LOG_FILE_NAME}")
+                  )
+              }
+
+              private fun loadLogsFromDisk() {
+                  for (file in getCandidateLogFiles()) {
+                      try {
+                          if (file.exists() && file.canRead() && file.length() > 0) {
+                              val content = file.readText().trim()
+                              if (content.isNotEmpty()) {
+                                  logBuilder.clear()
+                                  logBuilder.append(content)
+                                  tvLogContent.text = content
+                                  scrollViewLogs.post {
+                                      scrollViewLogs.fullScroll(View.FOCUS_DOWN)
+                                  }
+                                  return
+                              }
+                          }
+                      } catch (_: Throwable) {
+                      }
+                  }
+
+                  if (logBuilder.isEmpty()) {
+                      tvLogContent.text = getString(R.string.no_logs_yet)
+                  }
+              }
+
+              private fun clearLogs() {
+                  logBuilder.clear()
+                  tvLogContent.text = getString(R.string.no_logs_yet)
+                  for (file in getCandidateLogFiles()) {
+                      try {
+                          if (file.exists() && file.canWrite()) {
+                              file.writeText("")
+                          }
+                      } catch (_: Throwable) {
+                      }
+                  }
+                  Toast.makeText(this, "تم مسح السجل", Toast.LENGTH_SHORT).show()
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  try {
+                      unregisterReceiver(logReceiver)
+                  } catch (_: Throwable) {
+                  }
+              }
+          }
+          EOF
+
+          # 3. كتابة ملف تخطيط الواجهة activity_main.xml
+          cat << 'EOF' > app/src/main/res/layout/activity_main.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:background="#121212"
+              android:padding="16dp">
+
+              <TextView
+                  android:id="@+id/tvTitle"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="HS UnMock GPS &amp; Log Catcher"
+                  android:textColor="#FFFFFF"
+                  android:textSize="20sp"
+                  android:textStyle="bold" />
+
+              <TextView
+                  android:id="@+id/tvStatus"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="4dp"
+                  android:layout_marginBottom="12dp"
+                  android:text="الحزمة المستهدفة: com.logistics.rider.hungerstation"
+                  android:textColor="#4CAF50"
+                  android:textSize="13sp" />
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="horizontal"
+                  android:layout_marginBottom="12dp">
+
+                  <Button
+                      android:id="@+id/btnCopyLog"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1.5"
+                      android:text="Copy Log"
+                      android:textAllCaps="false"
+                      android:backgroundTint="#2196F3"
+                      android:textColor="#FFFFFF" />
+
+                  <Button
+                      android:id="@+id/btnRefreshLog"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:layout_marginStart="8dp"
+                      android:text="Refresh"
+                      android:textAllCaps="false"
+                      android:backgroundTint="#424242"
+                      android:textColor="#FFFFFF" />
+
+                  <Button
+                      android:id="@+id/btnClearLog"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:layout_marginStart="8dp"
+                      android:text="Clear"
+                      android:textAllCaps="false"
+                      android:backgroundTint="#D32F2F"
+                      android:textColor="#FFFFFF" />
+              </LinearLayout>
+
+              <ScrollView
+                  android:id="@+id/scrollViewLogs"
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_weight="1"
+                  android:background="#1E1E1E"
+                  android:padding="12dp"
+                  android:fillViewport="true">
+
+                  <HorizontalScrollView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:fillViewport="true">
+
+                      <TextView
+                          android:id="@+id/tvLogContent"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:fontFamily="monospace"
+                          android:text="@string/no_logs_yet"
+                          android:textColor="#00E676"
+                          android:textIsSelectable="true"
+                          android:textSize="12sp" />
+                  </HorizontalScrollView>
+              </ScrollView>
+
+          </LinearLayout>
+          EOF
+
+          # 4. تحديث ملف النصوص والنطاق strings.xml
+          cat << 'EOF' > app/src/main/res/values/strings.xml
+          <resources>
+              <string name="app_name">UnMock GPS</string>
+              <string name="no_logs_yet">بانتظار صيد السجلات من تطبيق هنقرستيشن للمندوب (com.logistics.rider.hungerstation)...</string>
+              <string-array name="xposedscope">
+                  <item>com.logistics.rider.hungerstation</item>
+              </string-array>
+          </resources>
+          EOF
+
+          # 5. تحديث ملف AndroidManifest.xml لتسجيل الواجهة وتحديد النطاق
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+
+              <application
+                  android:allowBackup="true"
+                  android:dataExtractionRules="@xml/data_extraction_rules"
+                  android:fullBackupContent="@xml/backup_rules"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.UnMock_gps" >
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <meta-data
+                      android:name="xposedmodule"
+                      android:value="true" />
+
+                  <meta-data
+                      android:name="xposeddescription"
+                      android:value="Prevents HungerStation Rider app from detecting mock location providers and captures app logs." />
+
+                  <meta-data
+                      android:name="xposedminversion"
+                      android:value="82" />
+
+                  <meta-data
+                      android:name="xposedscope"
+                      android:resource="@array/xposedscope" />
+              </application>
+
+          </manifest>
+          EOF
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK Platform 36
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" || sdkmanager "platforms;android-36.1" "build-tools;36.0.0" || true
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Build Release APK (Unsigned)
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: hs-assist-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: hs-assist-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: warn
