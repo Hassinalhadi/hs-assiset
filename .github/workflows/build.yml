@@ -281,15 +281,15 @@ jobs:
                           "attachBaseContext",
                           Context::class.java,
                           object : XC_MethodHook() {
-                              override fun afterHookedMethod(param: MethodHookParam) {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
                                   try {
                                       val ctx = param.args[0] as? Context ?: return
                                       if (appContext == null) {
                                           appContext = ctx.applicationContext ?: ctx
                                           loadPreviousSessionLogs()
                                           sanitizeIncogniaDatabase(appContext!!)
-                                          setupIntegrityHooks(lpparam)
                                       }
+                                      setupIntegrityHooks(lpparam, ctx.classLoader)
                                   } catch (_: Throwable) {
                                   }
                               }
@@ -302,13 +302,13 @@ jobs:
                           Application::class.java,
                           "onCreate",
                           object : XC_MethodHook() {
-                              override fun afterHookedMethod(param: MethodHookParam) {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
                                   try {
                                       val app = param.thisObject as? Application ?: return
                                       appContext = app.applicationContext ?: app
                                       loadPreviousSessionLogs()
                                       sanitizeIncogniaDatabase(appContext!!)
-                                      setupIntegrityHooks(lpparam)
+                                      setupIntegrityHooks(lpparam, app.classLoader)
                                   } catch (_: Throwable) {
                                   }
                               }
@@ -318,11 +318,11 @@ jobs:
               }
 
               private val integrityHooked = AtomicBoolean(false)
-              private fun setupIntegrityHooks(lpparam: XC_LoadPackage.LoadPackageParam) {
-                  val classLoader = resolveContext()?.classLoader ?: lpparam.classLoader ?: return
+              private val coroutineIntegrityHooked = AtomicBoolean(false)
+              private fun setupIntegrityHooks(lpparam: XC_LoadPackage.LoadPackageParam, customClassLoader: ClassLoader? = null) {
+                  val classLoader = customClassLoader ?: resolveContext()?.classLoader ?: lpparam.classLoader ?: return
 
                   // 1. اعتراض دالة verifyRootIntegrity المباشرة في RiderSupportFeaturesImpl
-                  // (تجنب إرجاع kotlin.Unit داخل invokeSuspend لأنه يسبب ClassCastException في الكوروتين ويؤدي إلى تسجيل الخروج)
                   runCatching {
                       val implCls = XposedHelpers.findClassIfExists(
                           "com.roadrunner.rider.support.implementation.RiderSupportFeaturesImpl",
@@ -338,23 +338,26 @@ jobs:
                                       Void.TYPE -> null
                                       else -> kotlin.Unit
                                   }
-                                  captureLog("HOOK", MODULE_TAG, "🛡️ تم تجاوز RiderSupportFeaturesImpl.verifyRootIntegrity بأمان")
+                                  captureLog("HOOK", MODULE_TAG, "🛡️ تم تجاوز RiderSupportFeaturesImpl.verifyRootIntegrity من البداية")
                               }
                           })
                       }
                   }
 
-                  // 2. اعتراض الكوروتين verifyRootIntegrity$1.invokeSuspend لمعالجة أي استثناء فقط دون إفساد نوع الإرجاع
+                  // 2. إيقاف الكوروتين verifyRootIntegrity$1.invokeSuspend في beforeHookedMethod قبل تنفيذ الكراش المتعمد (OOM 622MB / divide by zero)
                   runCatching {
                       val coroutineCls = XposedHelpers.findClassIfExists(
                           "com.roadrunner.rider.support.implementation.RiderSupportFeaturesImpl\$verifyRootIntegrity\$1",
                           classLoader
                       )
-                      if (coroutineCls != null) {
+                      if (coroutineCls != null && coroutineIntegrityHooked.compareAndSet(false, true)) {
                           XposedBridge.hookAllMethods(coroutineCls, "invokeSuspend", object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  param.result = kotlin.Unit
+                                  captureLog("HOOK", MODULE_TAG, "🛡️ تم إحباط تنفيذ verifyRootIntegrity\$1.invokeSuspend مسبقاً (منع OOM و divide by zero)")
+                              }
                               override fun afterHookedMethod(param: MethodHookParam) {
                                   if (param.throwable != null) {
-                                      captureLog("HOOK", MODULE_TAG, "🛡️ تم إخماد استثناء داخل verifyRootIntegrity\$1: ${param.throwable.message}")
                                       param.throwable = null
                                       param.result = kotlin.Unit
                                   }
@@ -717,7 +720,13 @@ jobs:
                   if (msg.contains(MODULE_TAG)) {
                       return true
                   }
-                  if (tag == "FirebaseRemoteConfig" && msg.contains("An entry in the defaults XML has an invalid key")) {
+                  if (tag == "FlagStore" || tag == "FlagRegistrar") {
+                      return true
+                  }
+                  if (tag == "GoogleApiManager" && (msg.contains("Unknown calling package name 'com.google.android.gms'") || msg.contains("Failed to get service from broker") || msg.contains("DEVELOPER_ERROR"))) {
+                      return true
+                  }
+                  if (tag == "FirebaseRemoteConfig" && (msg.contains("An entry in the defaults XML has an invalid key") || msg.contains("No value of type"))) {
                       val count = firebaseWarnCounter.incrementAndGet()
                       if (count > 2) return true
                   }
