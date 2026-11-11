@@ -100,13 +100,18 @@ jobs:
 
           import android.app.AndroidAppHelper
           import android.app.Application
+          import android.content.ContentResolver
           import android.content.Context
           import android.content.ContextWrapper
           import android.content.Intent
+          import android.content.pm.ApplicationInfo
+          import android.content.pm.PackageInfo
           import android.location.Location
+          import android.os.BaseBundle
           import android.os.Bundle
           import android.os.Looper
           import android.os.Process
+          import android.provider.Settings
           import android.util.Log
           import de.robv.android.xposed.IXposedHookLoadPackage
           import de.robv.android.xposed.IXposedHookZygoteInit
@@ -144,6 +149,31 @@ jobs:
                   const val EXTRA_LOG_LINE = "extra_log_line"
                   const val LOCAL_SERVER_PORT = 45821
                   private const val MAX_MEMORY_LOGS = 2000
+
+                  private val BLOCKED_SETTINGS_KEYS = setOf(
+                      "mock_location",
+                      "allow_mock_location",
+                      "development_settings_enabled",
+                      "adb_enabled",
+                      "usb_mass_storage_enabled"
+                  )
+
+                  private val SUSPICIOUS_PACKAGE_KEYWORDS = listOf(
+                      "unmockgps",
+                      "fakegps",
+                      "mock",
+                      "spoof",
+                      "gpsjoystick",
+                      "lexa.fakegps",
+                      "incorporateapps",
+                      "lsposed",
+                      "lspatch",
+                      "edxposed",
+                      "xposed",
+                      "magisk",
+                      "kernelsu",
+                      "apatch"
+                  )
               }
 
               private val isCapturing = ThreadLocal.withInitial { false }
@@ -186,10 +216,10 @@ jobs:
                   // 5. تفعيل صائد السجلات والكراشات
                   setupLogAndCrashCatcher()
 
-                  // 6. تفعيل خطافات الموقع الآمنة (Mock Location Bypass)
-                  setupLocationHooks()
+                  // 6. تفعيل خطافات الموقع الشاملة (Location + Settings + Bundle + PackageManager)
+                  setupLocationHooks(lpparam)
 
-                  // 7. تفعيل خطاف تجاوز فحص verifyRootIntegrity المسبب للكراش في error.txt
+                  // 7. تفعيل خطاف تجاوز فحص verifyRootIntegrity و Incognia
                   setupIntegrityHooks(lpparam)
               }
 
@@ -261,39 +291,47 @@ jobs:
                   }
               }
 
-              // اعتراض فحص verifyRootIntegrity الذي ظهر في error.txt وتسبب في انهيار التطبيق
               private val integrityHooked = AtomicBoolean(false)
               private fun setupIntegrityHooks(lpparam: XC_LoadPackage.LoadPackageParam) {
-                  if (integrityHooked.get()) return
                   val classLoader = resolveContext()?.classLoader ?: lpparam.classLoader ?: return
 
-                  // 1. اعتراض الكوروتين RiderSupportFeaturesImpl$verifyRootIntegrity$1.invokeSuspend
-                  runCatching {
-                      val coroutineCls = XposedHelpers.findClassIfExists(
-                          "com.roadrunner.rider.support.implementation.RiderSupportFeaturesImpl\$verifyRootIntegrity\$1",
-                          classLoader
-                      )
-                      if (coroutineCls != null && integrityHooked.compareAndSet(false, true)) {
-                          XposedBridge.hookAllMethods(coroutineCls, "invokeSuspend", object : XC_MethodHook() {
-                              override fun beforeHookedMethod(param: MethodHookParam) {
-                                  param.result = kotlin.Unit
-                                  captureLog("HOOK", MODULE_TAG, "🛡️ تم اعتراض وإيقاف فحص verifyRootIntegrity لمنع انهيار التطبيق")
-                              }
-                          })
-                      }
-                  }
-
-                  // 2. اعتراض دالة verifyRootIntegrity المباشرة في RiderSupportFeaturesImpl
+                  // 1. اعتراض دالة verifyRootIntegrity المباشرة في RiderSupportFeaturesImpl
+                  // (تجنب إرجاع kotlin.Unit داخل invokeSuspend لأنه يسبب ClassCastException في الكوروتين ويؤدي إلى تسجيل الخروج)
                   runCatching {
                       val implCls = XposedHelpers.findClassIfExists(
                           "com.roadrunner.rider.support.implementation.RiderSupportFeaturesImpl",
                           classLoader
                       )
-                      if (implCls != null) {
+                      if (implCls != null && integrityHooked.compareAndSet(false, true)) {
                           XposedBridge.hookAllMethods(implCls, "verifyRootIntegrity", object : XC_MethodHook() {
                               override fun beforeHookedMethod(param: MethodHookParam) {
-                                  param.result = kotlin.Unit
-                                  captureLog("HOOK", MODULE_TAG, "🛡️ تم تجاوز RiderSupportFeaturesImpl.verifyRootIntegrity بنجاح")
+                                  val method = param.method as? java.lang.reflect.Method
+                                  val returnType = method?.returnType
+                                  param.result = when (returnType) {
+                                      Boolean::class.javaPrimitiveType, java.lang.Boolean::class.java -> true
+                                      Void.TYPE -> null
+                                      else -> kotlin.Unit
+                                  }
+                                  captureLog("HOOK", MODULE_TAG, "🛡️ تم تجاوز RiderSupportFeaturesImpl.verifyRootIntegrity بأمان")
+                              }
+                          })
+                      }
+                  }
+
+                  // 2. اعتراض الكوروتين verifyRootIntegrity$1.invokeSuspend لمعالجة أي استثناء فقط دون إفساد نوع الإرجاع
+                  runCatching {
+                      val coroutineCls = XposedHelpers.findClassIfExists(
+                          "com.roadrunner.rider.support.implementation.RiderSupportFeaturesImpl\$verifyRootIntegrity\$1",
+                          classLoader
+                      )
+                      if (coroutineCls != null) {
+                          XposedBridge.hookAllMethods(coroutineCls, "invokeSuspend", object : XC_MethodHook() {
+                              override fun afterHookedMethod(param: MethodHookParam) {
+                                  if (param.throwable != null) {
+                                      captureLog("HOOK", MODULE_TAG, "🛡️ تم إخماد استثناء داخل verifyRootIntegrity\$1: ${param.throwable.message}")
+                                      param.throwable = null
+                                      param.result = kotlin.Unit
+                                  }
                               }
                           })
                       }
@@ -390,11 +428,41 @@ jobs:
                   serverThread.start()
               }
 
-              private fun setupLocationHooks() {
+              private fun sanitizeLocationObject(loc: Location?) {
+                  if (loc == null) return
+                  try {
+                      // تصفير حقل mIsFromMockProviderMask أو mIsFromMockProvider الداخلي عبر الانعكاس
+                      runCatching {
+                          val maskField = Location::class.java.getDeclaredField("mIsFromMockProviderMask")
+                          maskField.isAccessible = true
+                          val mask = maskField.getInt(null)
+                          val fieldsMaskField = Location::class.java.getDeclaredField("mFieldsMask")
+                          fieldsMaskField.isAccessible = true
+                          val currentMask = fieldsMaskField.getInt(loc)
+                          if ((currentMask and mask) != 0) {
+                              fieldsMaskField.setInt(loc, currentMask and mask.inv())
+                          }
+                      }
+                      runCatching {
+                          val boolField = Location::class.java.getDeclaredField("mIsFromMockProvider")
+                          boolField.isAccessible = true
+                          if (boolField.getBoolean(loc)) {
+                              boolField.setBoolean(loc, false)
+                          }
+                      }
+                  } catch (_: Throwable) {
+                  }
+              }
+
+              private fun setupLocationHooks(lpparam: XC_LoadPackage.LoadPackageParam) {
                   val locationClass = Location::class.java
 
+                  // 1. إخفاء علامات التزييف المباشرة على Location
                   runCatching {
                       XposedHelpers.findAndHookMethod(locationClass, "isMock", object : XC_MethodHook() {
+                          override fun beforeHookedMethod(param: MethodHookParam) {
+                              sanitizeLocationObject(param.thisObject as? Location)
+                          }
                           override fun afterHookedMethod(param: MethodHookParam) {
                               try {
                                   val original = param.result as? Boolean ?: false
@@ -410,6 +478,9 @@ jobs:
 
                   runCatching {
                       XposedHelpers.findAndHookMethod(locationClass, "isFromMockProvider", object : XC_MethodHook() {
+                          override fun beforeHookedMethod(param: MethodHookParam) {
+                              sanitizeLocationObject(param.thisObject as? Location)
+                          }
                           override fun afterHookedMethod(param: MethodHookParam) {
                               try {
                                   val original = param.result as? Boolean ?: false
@@ -423,13 +494,45 @@ jobs:
                       })
                   }
 
+                  // منع ضبط الموقع كمزيف من الأساس
+                  runCatching {
+                      XposedHelpers.findAndHookMethod(locationClass, "setIsFromMockProvider", Boolean::class.javaPrimitiveType, object : XC_MethodHook() {
+                          override fun beforeHookedMethod(param: MethodHookParam) {
+                              param.args[0] = false
+                          }
+                      })
+                  }
+
+                  runCatching {
+                      XposedHelpers.findAndHookMethod(locationClass, "setMock", Boolean::class.javaPrimitiveType, object : XC_MethodHook() {
+                          override fun beforeHookedMethod(param: MethodHookParam) {
+                              param.args[0] = false
+                          }
+                      })
+                  }
+
+                  // تنظيف Location عند الإنشاء أو النسخ
+                  runCatching {
+                      XposedBridge.hookAllConstructors(locationClass, object : XC_MethodHook() {
+                          override fun afterHookedMethod(param: MethodHookParam) {
+                              sanitizeLocationObject(param.thisObject as? Location)
+                          }
+                      })
+                      XposedHelpers.findAndHookMethod(locationClass, "set", Location::class.java, object : XC_MethodHook() {
+                          override fun afterHookedMethod(param: MethodHookParam) {
+                              sanitizeLocationObject(param.thisObject as? Location)
+                          }
+                      })
+                  }
+
+                  // 2. تحسين بيانات الدقة والارتفاع والسرعة
                   runCatching {
                       XposedHelpers.findAndHookMethod(locationClass, "getAccuracy", object : XC_MethodHook() {
                           override fun afterHookedMethod(param: MethodHookParam) {
                               try {
                                   val acc = param.result as? Float ?: 0f
-                                  if (acc <= 0.0f || acc > 100.0f) {
-                                      param.result = 4.5f
+                                  if (acc <= 0.0f || acc > 100.0f || acc == 5.0f) {
+                                      param.result = 4.2f
                                   }
                               } catch (_: Throwable) {
                               }
@@ -440,25 +543,30 @@ jobs:
                   runCatching {
                       XposedHelpers.findAndHookMethod(locationClass, "hasAccuracy", object : XC_MethodHook() {
                           override fun afterHookedMethod(param: MethodHookParam) {
-                              try {
-                                  param.result = true
-                              } catch (_: Throwable) {
-                              }
+                              param.result = true
                           }
                       })
                   }
 
+                  // 3. تنظيف الـ Extras من مفاتيح تطبيقات التزييف
                   runCatching {
                       XposedHelpers.findAndHookMethod(locationClass, "getExtras", object : XC_MethodHook() {
                           override fun afterHookedMethod(param: MethodHookParam) {
                               try {
                                   val extras = param.result as? Bundle ?: return
                                   extras.classLoader = Location::class.java.classLoader
-                                  if (extras.containsKey("mockLocation")) {
-                                      val copy = Bundle(extras)
-                                      copy.remove("mockLocation")
+                                  val suspiciousKeys = listOf("mockLocation", "isMock", "mock", "gps_mock", "fromMockProvider")
+                                  var modified = false
+                                  val copy = Bundle(extras)
+                                  for (k in suspiciousKeys) {
+                                      if (copy.containsKey(k)) {
+                                          copy.remove(k)
+                                          modified = true
+                                      }
+                                  }
+                                  if (modified) {
                                       param.result = copy
-                                      captureLog("HOOK", MODULE_TAG, "Location.getExtras() تم حذف مفتاح mockLocation بأمان")
+                                      captureLog("HOOK", MODULE_TAG, "Location.getExtras() تم تنظيف مفاتيح التزييف بنجاح")
                                   }
                               } catch (_: Throwable) {
                               }
@@ -466,7 +574,114 @@ jobs:
                       })
                   }
 
-                  captureLog("INFO", MODULE_TAG, "تم تفعيل كافة خطافات الموقع (Location Hooks) بنجاح")
+                  // 4. إصلاح خطأ Incognia في BaseBundle.getString (الظاهر في السجل 65.txt)
+                  // Key com.android.vending.derived.apk.id expected String but value was a java.lang.Integer
+                  runCatching {
+                      XposedHelpers.findAndHookMethod(BaseBundle::class.java, "getString", String::class.java, object : XC_MethodHook() {
+                          override fun beforeHookedMethod(param: MethodHookParam) {
+                              try {
+                                  val key = param.args[0] as? String ?: return
+                                  if (key == "com.android.vending.derived.apk.id") {
+                                      val bundle = param.thisObject as? BaseBundle ?: return
+                                      val rawObj = bundle.get(key)
+                                      if (rawObj is Int) {
+                                          param.result = rawObj.toString()
+                                      }
+                                  }
+                              } catch (_: Throwable) {
+                              }
+                          }
+                      })
+                  }
+
+                  // 5. إخفاء إعدادات المطور والـ Mock Location عن Settings.Secure و Settings.Global (مهم لـ Incognia وهنقرستيشن)
+                  val settingsClasses = listOf(Settings.Secure::class.java, Settings.Global::class.java, Settings.System::class.java)
+                  for (settingsCls in settingsClasses) {
+                      runCatching {
+                          XposedHelpers.findAndHookMethod(
+                              settingsCls,
+                              "getString",
+                              ContentResolver::class.java,
+                              String::class.java,
+                              object : XC_MethodHook() {
+                                  override fun beforeHookedMethod(param: MethodHookParam) {
+                                      val key = param.args[1] as? String ?: return
+                                      if (key in BLOCKED_SETTINGS_KEYS) {
+                                          param.result = "0"
+                                      }
+                                  }
+                              }
+                          )
+                      }
+                      runCatching {
+                          XposedHelpers.findAndHookMethod(
+                              settingsCls,
+                              "getInt",
+                              ContentResolver::class.java,
+                              String::class.java,
+                              Int::class.javaPrimitiveType,
+                              object : XC_MethodHook() {
+                                  override fun beforeHookedMethod(param: MethodHookParam) {
+                                      val key = param.args[1] as? String ?: return
+                                      if (key in BLOCKED_SETTINGS_KEYS) {
+                                          param.result = 0
+                                      }
+                                  }
+                              }
+                          )
+                      }
+                      runCatching {
+                          XposedHelpers.findAndHookMethod(
+                              settingsCls,
+                              "getInt",
+                              ContentResolver::class.java,
+                              String::class.java,
+                              object : XC_MethodHook() {
+                                  override fun beforeHookedMethod(param: MethodHookParam) {
+                                      val key = param.args[1] as? String ?: return
+                                      if (key in BLOCKED_SETTINGS_KEYS) {
+                                          param.result = 0
+                                      }
+                                  }
+                              }
+                          )
+                      }
+                  }
+
+                  // 6. إخفاء حزمة الموديول وتطبيقات Fake GPS من فحوصات PackageManager (التي تستخدمها Incognia)
+                  runCatching {
+                      val apmClass = XposedHelpers.findClassIfExists("android.app.ApplicationPackageManager", lpparam.classLoader)
+                      if (apmClass != null) {
+                          XposedBridge.hookAllMethods(apmClass, "getInstalledPackages", object : XC_MethodHook() {
+                              override fun afterHookedMethod(param: MethodHookParam) {
+                                  val list = param.result as? MutableList<*> ?: return
+                                  val iterator = list.iterator()
+                                  while (iterator.hasNext()) {
+                                      val item = iterator.next() as? PackageInfo ?: continue
+                                      val pkg = item.packageName?.lowercase(Locale.ROOT) ?: continue
+                                      if (SUSPICIOUS_PACKAGE_KEYWORDS.any { pkg.contains(it) }) {
+                                          iterator.remove()
+                                      }
+                                  }
+                              }
+                          })
+                          XposedBridge.hookAllMethods(apmClass, "getInstalledApplications", object : XC_MethodHook() {
+                              override fun afterHookedMethod(param: MethodHookParam) {
+                                  val list = param.result as? MutableList<*> ?: return
+                                  val iterator = list.iterator()
+                                  while (iterator.hasNext()) {
+                                      val item = iterator.next() as? ApplicationInfo ?: continue
+                                      val pkg = item.packageName?.lowercase(Locale.ROOT) ?: continue
+                                      if (SUSPICIOUS_PACKAGE_KEYWORDS.any { pkg.contains(it) }) {
+                                          iterator.remove()
+                                      }
+                                  }
+                              }
+                          })
+                      }
+                  }
+
+                  captureLog("INFO", MODULE_TAG, "تم تفعيل كافة خطافات الموقع والحماية (Location & Anti-Detection Hooks) بنجاح")
               }
 
               private fun isIgnoredOrSpam(tag: String, msg: String): Boolean {
@@ -487,7 +702,6 @@ jobs:
                   return false
               }
 
-              // التحقق مما إذا كان الاستثناء ناتجاً عن فحص التكامل الخلفي لمنعه من قتل التطبيق
               private fun isIntegrityCrash(throwable: Throwable): Boolean {
                   val trace = throwable.stackTrace
                   for (element in trace) {
@@ -518,7 +732,6 @@ jobs:
                               syncDiskImmediately = true
                           )
                       }
-                      // إذا كان الاستثناء في خيط خلفي (وليس خيط الواجهة الرئيسي) من فحص verifyRootIntegrity، امنعه من قتل التطبيق
                       if (thread !== Looper.getMainLooper().thread && isIntegrityCrash(throwable)) {
                           captureLog(
                               "HOOK",
@@ -596,7 +809,6 @@ jobs:
                           }
                       }
 
-                      // 1. تثبيت معالج استثناءات شامل يمنع تكرار السجل ويحبط كراشات verifyRootIntegrity الخلفية
                       runCatching {
                           val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
                           Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
@@ -604,7 +816,6 @@ jobs:
                           }
                       }
 
-                      // 2. اعتراض استبدال DefaultUncaughtExceptionHandler من قبل Sentry أو Crashlytics
                       runCatching {
                           XposedHelpers.findAndHookMethod(
                               Thread::class.java,
@@ -624,7 +835,6 @@ jobs:
                           )
                       }
 
-                      // 3. اعتراض Process.killProcess لتسجيل السبب
                       runCatching {
                           XposedHelpers.findAndHookMethod(
                               Process::class.java,
