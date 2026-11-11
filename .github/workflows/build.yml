@@ -8,13 +8,13 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: hs-assist-build-v2-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -115,6 +115,10 @@ jobs:
           }
           EOF
 
+      - name: Inject UnMockGPS.kt Module Code
+        shell: bash
+        run: |
+          set -e
           # 2. كتابة كود الموديول UnMockGPS.kt (مع اعتراض verifyRootIntegrity ومنع تكرار سجل الكراش)
           cat << 'EOF' > app/src/main/java/io/github/khalil212002/unmockgps/UnMockGPS.kt
           package io.github.khalil212002.unmockgps
@@ -980,6 +984,10 @@ jobs:
           }
           EOF
 
+      - name: Inject LogReceiver, MainActivity, Layouts & Manifest
+        shell: bash
+        run: |
+          set -e
           # 3. كتابة مستقبل البث الثابت LogReceiver.kt
           cat << 'EOF' > app/src/main/java/io/github/khalil212002/unmockgps/LogReceiver.kt
           package io.github.khalil212002.unmockgps
