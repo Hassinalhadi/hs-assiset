@@ -27,7 +27,7 @@ jobs:
           # 0. التأكد من نظافة ملف xposed_init لتوافق محمل LSPatch (بدون فراغات أو أسطر زائدة)
           printf "io.github.khalil212002.unmockgps.UnMockGPS\n" > app/src/main/assets/xposed_init
 
-          # 1. تحديث app/build.gradle.kts لدعم أحدث إصدارات LSPatch وتوقيع نسخة Release تلقائياً
+          # 1. تحديث app/build.gradle.kts مع الحفاظ على compileSdk 36 المتوافق مع androidx.core:1.18.0
           cat << 'EOF' > app/build.gradle.kts
           plugins {
               alias(libs.plugins.android.application)
@@ -35,12 +35,16 @@ jobs:
 
           android {
               namespace = "io.github.khalil212002.unmockgps"
-              compileSdk = 35
+              compileSdk {
+                  version = release(36) {
+                      minorApiLevel = 1
+                  }
+              }
 
               defaultConfig {
                   applicationId = "io.github.khalil212002.unmockgps"
                   minSdk = 28
-                  targetSdk = 34
+                  targetSdk = 33
                   versionCode = 2
                   versionName = "1.1-lspatch"
 
