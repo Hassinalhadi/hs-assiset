@@ -45,8 +45,8 @@ jobs:
                   applicationId = "io.github.khalil212002.unmockgps"
                   minSdk = 28
                   targetSdk = 33
-                  versionCode = 3
-                  versionName = "1.2-lspatch-stable"
+                  versionCode = 4
+                  versionName = "1.3-lspatch-stable"
 
                   testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
               }
@@ -94,7 +94,7 @@ jobs:
           }
           EOF
 
-          # 2. كتابة كود الموديول UnMockGPS.kt (معالجة الكراش + طابور غير متزامن + حفظ الكراش على القرص قبل موت العملية)
+          # 2. كتابة كود الموديول UnMockGPS.kt (مع اعتراض verifyRootIntegrity ومنع تكرار سجل الكراش)
           cat << 'EOF' > app/src/main/java/io/github/khalil212002/unmockgps/UnMockGPS.kt
           package io.github.khalil212002.unmockgps
 
@@ -105,6 +105,7 @@ jobs:
           import android.content.Intent
           import android.location.Location
           import android.os.Bundle
+          import android.os.Looper
           import android.os.Process
           import android.util.Log
           import de.robv.android.xposed.IXposedHookLoadPackage
@@ -123,8 +124,10 @@ jobs:
           import java.net.InetAddress
           import java.net.ServerSocket
           import java.text.SimpleDateFormat
+          import java.util.Collections
           import java.util.Date
           import java.util.Locale
+          import java.util.WeakHashMap
           import java.util.concurrent.ConcurrentLinkedQueue
           import java.util.concurrent.CopyOnWriteArrayList
           import java.util.concurrent.atomic.AtomicBoolean
@@ -146,6 +149,7 @@ jobs:
               private val isCapturing = ThreadLocal.withInitial { false }
               private val memoryLogs = CopyOnWriteArrayList<String>()
               private val asyncLogQueue = ConcurrentLinkedQueue<String>()
+              private val loggedCrashThrowables = Collections.synchronizedSet(Collections.newSetFromMap(WeakHashMap<Throwable, Boolean>()))
               private val serverStarted = AtomicBoolean(false)
               private val workerStarted = AtomicBoolean(false)
               private val hooksInstalled = AtomicBoolean(false)
@@ -165,25 +169,28 @@ jobs:
 
                   if (!hooksInstalled.compareAndSet(false, true)) return
 
-                  // 1. تحميل سجلات الجلسة السابقة (للحفاظ على أي Crash حدث قبل إعادة تشغيل التطبيق)
+                  // 1. تحميل سجلات الجلسة السابقة
                   loadPreviousSessionLogs()
 
-                  // 2. تشغيل خيط الكتابة الخلفي لمنع تجميد الواجهة (Skipped frames / ANR)
+                  // 2. تشغيل خيط الكتابة الخلفي لمنع تجميد الواجهة
                   startAsyncLogWorker()
 
                   // 3. تشغيل الخادم المحلي لنقل السجلات لواجهة التطبيق
                   startLocalLogServer()
 
-                  // 4. التقاط Context التطبيق وتنظيف قاعدة بيانات incognia_errors المسببة للكراش
-                  hookApplicationContext()
+                  // 4. التقاط Context التطبيق وتنظيف قاعدة بيانات incognia_errors
+                  hookApplicationContext(lpparam)
 
                   captureLog("INFO", MODULE_TAG, "=== بدء جلسة جديدة داخل: ${lpparam.packageName} (PID=${Process.myPid()}) ===")
 
-                  // 5. تفعيل صائد السجلات والكراشات (بما في ذلك AndroidRuntime و Sentry/Crashlytics)
+                  // 5. تفعيل صائد السجلات والكراشات
                   setupLogAndCrashCatcher()
 
                   // 6. تفعيل خطافات الموقع الآمنة (Mock Location Bypass)
                   setupLocationHooks()
+
+                  // 7. تفعيل خطاف تجاوز فحص verifyRootIntegrity المسبب للكراش في error.txt
+                  setupIntegrityHooks(lpparam)
               }
 
               private fun formatNow(): String {
@@ -211,7 +218,7 @@ jobs:
                   }
               }
 
-              private fun hookApplicationContext() {
+              private fun hookApplicationContext(lpparam: XC_LoadPackage.LoadPackageParam) {
                   runCatching {
                       XposedHelpers.findAndHookMethod(
                           ContextWrapper::class.java,
@@ -225,6 +232,7 @@ jobs:
                                           appContext = ctx.applicationContext ?: ctx
                                           loadPreviousSessionLogs()
                                           sanitizeIncogniaDatabase(appContext!!)
+                                          setupIntegrityHooks(lpparam)
                                       }
                                   } catch (_: Throwable) {
                                   }
@@ -244,6 +252,7 @@ jobs:
                                       appContext = app.applicationContext ?: app
                                       loadPreviousSessionLogs()
                                       sanitizeIncogniaDatabase(appContext!!)
+                                      setupIntegrityHooks(lpparam)
                                   } catch (_: Throwable) {
                                   }
                               }
@@ -252,7 +261,45 @@ jobs:
                   }
               }
 
-              // إصلاح كراش SQLiteBlobTooBigException: Row too big to fit into CursorWindow (SELECT * FROM incognia_errors)
+              // اعتراض فحص verifyRootIntegrity الذي ظهر في error.txt وتسبب في انهيار التطبيق
+              private val integrityHooked = AtomicBoolean(false)
+              private fun setupIntegrityHooks(lpparam: XC_LoadPackage.LoadPackageParam) {
+                  if (integrityHooked.get()) return
+                  val classLoader = resolveContext()?.classLoader ?: lpparam.classLoader ?: return
+
+                  // 1. اعتراض الكوروتين RiderSupportFeaturesImpl$verifyRootIntegrity$1.invokeSuspend
+                  runCatching {
+                      val coroutineCls = XposedHelpers.findClassIfExists(
+                          "com.roadrunner.rider.support.implementation.RiderSupportFeaturesImpl\$verifyRootIntegrity\$1",
+                          classLoader
+                      )
+                      if (coroutineCls != null && integrityHooked.compareAndSet(false, true)) {
+                          XposedBridge.hookAllMethods(coroutineCls, "invokeSuspend", object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  param.result = kotlin.Unit
+                                  captureLog("HOOK", MODULE_TAG, "🛡️ تم اعتراض وإيقاف فحص verifyRootIntegrity لمنع انهيار التطبيق")
+                              }
+                          })
+                      }
+                  }
+
+                  // 2. اعتراض دالة verifyRootIntegrity المباشرة في RiderSupportFeaturesImpl
+                  runCatching {
+                      val implCls = XposedHelpers.findClassIfExists(
+                          "com.roadrunner.rider.support.implementation.RiderSupportFeaturesImpl",
+                          classLoader
+                      )
+                      if (implCls != null) {
+                          XposedBridge.hookAllMethods(implCls, "verifyRootIntegrity", object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  param.result = kotlin.Unit
+                                  captureLog("HOOK", MODULE_TAG, "🛡️ تم تجاوز RiderSupportFeaturesImpl.verifyRootIntegrity بنجاح")
+                              }
+                          })
+                      }
+                  }
+              }
+
               private fun sanitizeIncogniaDatabase(ctx: Context) {
                   Thread {
                       try {
@@ -309,7 +356,6 @@ jobs:
                                       clearLocalFiles()
                                       writer.println("CLEARED")
                                   } else {
-                                      // إرسال السجلات المحفوظة على القرص أولاً ثم الذاكرة لضمان عدم ضياع أي كراش سابق
                                       val sentLines = LinkedHashSet<String>()
                                       try {
                                           val diskFile = getPrimaryInternalLogFile()
@@ -347,7 +393,6 @@ jobs:
               private fun setupLocationHooks() {
                   val locationClass = Location::class.java
 
-                  // إخفاء علامة الموقع الوهمي isMock بأمان تام
                   runCatching {
                       XposedHelpers.findAndHookMethod(locationClass, "isMock", object : XC_MethodHook() {
                           override fun afterHookedMethod(param: MethodHookParam) {
@@ -363,7 +408,6 @@ jobs:
                       })
                   }
 
-                  // إخفاء علامة المزود الوهمي isFromMockProvider بأمان تام
                   runCatching {
                       XposedHelpers.findAndHookMethod(locationClass, "isFromMockProvider", object : XC_MethodHook() {
                           override fun afterHookedMethod(param: MethodHookParam) {
@@ -379,7 +423,6 @@ jobs:
                       })
                   }
 
-                  // تعديل الدقة فقط إذا كانت 0 أو غير موجودة لتفادي كشف القيمة الثابتة
                   runCatching {
                       XposedHelpers.findAndHookMethod(locationClass, "getAccuracy", object : XC_MethodHook() {
                           override fun afterHookedMethod(param: MethodHookParam) {
@@ -405,7 +448,6 @@ jobs:
                       })
                   }
 
-                  // ملاحظة هامة: تجنب استدعاء containsKey المباشر بدون حماية على getExtras لأنه يرمي BadParcelableException ويسبب كراش
                   runCatching {
                       XposedHelpers.findAndHookMethod(locationClass, "getExtras", object : XC_MethodHook() {
                           override fun afterHookedMethod(param: MethodHookParam) {
@@ -419,7 +461,6 @@ jobs:
                                       captureLog("HOOK", MODULE_TAG, "Location.getExtras() تم حذف مفتاح mockLocation بأمان")
                                   }
                               } catch (_: Throwable) {
-                                  // تجاهل BadParcelableException حتى لا ينهار التطبيق المستهدف أبداً
                               }
                           }
                       })
@@ -439,12 +480,58 @@ jobs:
                   if (msg.contains(MODULE_TAG)) {
                       return true
                   }
-                  // منع طوفان تحذيرات FirebaseRemoteConfig من إغراق السجل وتبطيء التطبيق
                   if (tag == "FirebaseRemoteConfig" && msg.contains("An entry in the defaults XML has an invalid key")) {
                       val count = firebaseWarnCounter.incrementAndGet()
                       if (count > 2) return true
                   }
                   return false
+              }
+
+              // التحقق مما إذا كان الاستثناء ناتجاً عن فحص التكامل الخلفي لمنعه من قتل التطبيق
+              private fun isIntegrityCrash(throwable: Throwable): Boolean {
+                  val trace = throwable.stackTrace
+                  for (element in trace) {
+                      val cls = element.className
+                      if (cls.contains("RiderSupportFeaturesImpl") ||
+                          cls.contains("verifyRootIntegrity") ||
+                          cls.contains("ceilAwayFromZero") ||
+                          cls.contains("runlambda4notifyCallbackIfNeeded")
+                      ) {
+                          return true
+                      }
+                  }
+                  return false
+              }
+
+              private fun handleUncaught(
+                  thread: Thread,
+                  throwable: Throwable,
+                  delegate: Thread.UncaughtExceptionHandler?
+              ) {
+                  try {
+                      if (loggedCrashThrowables.add(throwable)) {
+                          captureLog(
+                              "CRASH",
+                              "UncaughtException",
+                              "💥 استثناء غير معالج في الخيط (${thread.name}): ${throwable.javaClass.name}: ${throwable.message}",
+                              throwable,
+                              syncDiskImmediately = true
+                          )
+                      }
+                      // إذا كان الاستثناء في خيط خلفي (وليس خيط الواجهة الرئيسي) من فحص verifyRootIntegrity، امنعه من قتل التطبيق
+                      if (thread !== Looper.getMainLooper().thread && isIntegrityCrash(throwable)) {
+                          captureLog(
+                              "HOOK",
+                              MODULE_TAG,
+                              "🛡️ تم إحباط إغلاق التطبيق الناتج عن استثناء خلفية (${throwable.message}) في الخيط ${thread.name}",
+                              null,
+                              syncDiskImmediately = true
+                          )
+                          return
+                      }
+                  } catch (_: Throwable) {
+                  }
+                  delegate?.uncaughtException(thread, throwable)
               }
 
               private fun setupLogAndCrashCatcher() {
@@ -509,25 +596,15 @@ jobs:
                           }
                       }
 
-                      // 1. تثبيت معالج استثناءات شامل يلتقط أي Crash قبل Sentry/Crashlytics ويحفظه فوراً على القرص
+                      // 1. تثبيت معالج استثناءات شامل يمنع تكرار السجل ويحبط كراشات verifyRootIntegrity الخلفية
                       runCatching {
                           val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
                           Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-                              try {
-                                  captureLog(
-                                      "CRASH",
-                                      "UncaughtException",
-                                      "💥 انهيار التطبيق في الخيط (${thread.name}): ${throwable.javaClass.name}: ${throwable.message}",
-                                      throwable,
-                                      syncDiskImmediately = true
-                                  )
-                              } catch (_: Throwable) {
-                              }
-                              previousHandler?.uncaughtException(thread, throwable)
+                              handleUncaught(thread, throwable, previousHandler)
                           }
                       }
 
-                      // 2. اعتراض استبدال DefaultUncaughtExceptionHandler من قبل Sentry أو Crashlytics ليبقى معالجنا نشطاً دائماً
+                      // 2. اعتراض استبدال DefaultUncaughtExceptionHandler من قبل Sentry أو Crashlytics
                       runCatching {
                           XposedHelpers.findAndHookMethod(
                               Thread::class.java,
@@ -538,17 +615,7 @@ jobs:
                                       try {
                                           val originalHandler = param.args[0] as? Thread.UncaughtExceptionHandler ?: return
                                           param.args[0] = Thread.UncaughtExceptionHandler { thread, throwable ->
-                                              try {
-                                                  captureLog(
-                                                      "CRASH",
-                                                      "UncaughtException",
-                                                      "💥 انهيار التطبيق في الخيط (${thread.name}): ${throwable.javaClass.name}: ${throwable.message}",
-                                                      throwable,
-                                                      syncDiskImmediately = true
-                                                  )
-                                              } catch (_: Throwable) {
-                                              }
-                                              originalHandler.uncaughtException(thread, throwable)
+                                              handleUncaught(thread, throwable, originalHandler)
                                           }
                                       } catch (_: Throwable) {
                                       }
@@ -557,7 +624,7 @@ jobs:
                           )
                       }
 
-                      // 3. اعتراض Process.killProcess و System.exit لتسجيل سبب إغلاق التطبيق وحفظ السجل قبل موت العملية
+                      // 3. اعتراض Process.killProcess لتسجيل السبب
                       runCatching {
                           XposedHelpers.findAndHookMethod(
                               Process::class.java,
@@ -572,33 +639,10 @@ jobs:
                                                   "CRASH",
                                                   "ProcessKill",
                                                   "⚠️ تم استدعاء Process.killProcess($pid) لإنهاء التطبيق",
-                                                  RuntimeException("StackTrace for killProcess"),
+                                                  null,
                                                   syncDiskImmediately = true
                                               )
                                           }
-                                      } catch (_: Throwable) {
-                                      }
-                                  }
-                              }
-                          )
-                      }
-
-                      runCatching {
-                          XposedHelpers.findAndHookMethod(
-                              System::class.java,
-                              "exit",
-                              Int::class.javaPrimitiveType,
-                              object : XC_MethodHook() {
-                                  override fun beforeHookedMethod(param: MethodHookParam) {
-                                      try {
-                                          val status = param.args[0] as? Int ?: 0
-                                          captureLog(
-                                              "CRASH",
-                                              "SystemExit",
-                                              "⚠️ تم استدعاء System.exit($status) لإنهاء التطبيق",
-                                              RuntimeException("StackTrace for System.exit"),
-                                              syncDiskImmediately = true
-                                          )
                                       } catch (_: Throwable) {
                                       }
                                   }
@@ -623,27 +667,26 @@ jobs:
                   isCapturing.set(true)
                   try {
                       val timestamp = formatNow()
-                      val FullLines = ArrayList<String>()
+                      val fullLines = ArrayList<String>()
                       val firstLine = "[$timestamp] [$level/$tag]: $message"
-                      FullLines.add(firstLine)
+                      fullLines.add(firstLine)
 
                       if (throwable != null) {
                           val sw = StringWriter()
                           throwable.printStackTrace(PrintWriter(sw))
                           val stackLines = sw.toString().trimEnd().lines()
                           for (sLine in stackLines) {
-                              FullLines.add("[$timestamp] [$level/$tag]:   $sLine")
+                              fullLines.add("[$timestamp] [$level/$tag]:   $sLine")
                           }
                       }
 
-                      for (line in FullLines) {
+                      for (line in fullLines) {
                           if (memoryLogs.size >= MAX_MEMORY_LOGS) {
                               memoryLogs.removeAt(0)
                           }
                           memoryLogs.add(line)
 
                           if (syncDiskImmediately) {
-                              // كتابة متزامنة فورية على القرص مع fd.sync() عند حدوث كراش لضمان عدم ضياع السطر قبل موت العملية
                               writeLineToDisk(line, syncImmediately = true)
                               dispatchBroadcastIntent(line)
                           } else {
@@ -709,7 +752,7 @@ jobs:
           }
           EOF
 
-          # 3. كتابة مستقبل البث الثابت LogReceiver.kt (يعمل في خيط خلفي لعدم تجميد الواجهة)
+          # 3. كتابة مستقبل البث الثابت LogReceiver.kt
           cat << 'EOF' > app/src/main/java/io/github/khalil212002/unmockgps/LogReceiver.kt
           package io.github.khalil212002.unmockgps
 
@@ -739,7 +782,7 @@ jobs:
           }
           EOF
 
-          # 4. كتابة واجهة المستخدم MainActivity.kt (مع زر فلترة الأخطاء والكراشات + حماية الأداء)
+          # 4. كتابة واجهة المستخدم MainActivity.kt
           cat << 'EOF' > app/src/main/java/io/github/khalil212002/unmockgps/MainActivity.kt
           package io.github.khalil212002.unmockgps
 
@@ -917,7 +960,6 @@ jobs:
                   Thread {
                       val collected = ArrayList<String>()
 
-                      // 1. السحب المباشر عبر Localhost Socket من التطبيق المعدل بـ LSPatch
                       try {
                           Socket().use { socket ->
                               socket.connect(InetSocketAddress("127.0.0.1", UnMockGPS.LOCAL_SERVER_PORT), 800)
@@ -935,7 +977,6 @@ jobs:
                       } catch (_: Throwable) {
                       }
 
-                      // 2. قراءة السجلات المستلمة عبر BroadcastReceiver والمحفوظة داخلياً
                       try {
                           val internalFile = File(filesDir, UnMockGPS.LOG_FILE_NAME)
                           if (internalFile.exists() && internalFile.canRead() && internalFile.length() > 0) {
@@ -1008,7 +1049,7 @@ jobs:
           }
           EOF
 
-          # 5. كتابة ملف تخطيط الواجهة activity_main.xml (مع زر فلترة الأخطاء)
+          # 5. كتابة ملف تخطيط الواجهة activity_main.xml
           cat << 'EOF' > app/src/main/res/layout/activity_main.xml
           <?xml version="1.0" encoding="utf-8"?>
           <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
