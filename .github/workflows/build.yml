@@ -15,7 +15,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Inject LSPatch Support, Log Catcher & UI into Project
+      - name: Inject LSPatch Support, Crash Fix, Async Log Catcher & UI into Project
         shell: bash
         run: |
           set -e
@@ -24,10 +24,10 @@ jobs:
           mkdir -p app/src/main/res/values
           mkdir -p app/src/main/assets
 
-          # 0. التأكد من نظافة ملف xposed_init لتوافق محمل LSPatch (بدون فراغات أو أسطر زائدة)
+          # 0. التأكد من نظافة ملف xposed_init لتوافق محمل LSPatch
           printf "io.github.khalil212002.unmockgps.UnMockGPS\n" > app/src/main/assets/xposed_init
 
-          # 1. تحديث app/build.gradle.kts مع الحفاظ على compileSdk 36 المتوافق مع androidx.core:1.18.0
+          # 1. تحديث app/build.gradle.kts مع compileSdk 36 وتوقيع Release تلقائياً
           cat << 'EOF' > app/build.gradle.kts
           plugins {
               alias(libs.plugins.android.application)
@@ -45,8 +45,8 @@ jobs:
                   applicationId = "io.github.khalil212002.unmockgps"
                   minSdk = 28
                   targetSdk = 33
-                  versionCode = 2
-                  versionName = "1.1-lspatch"
+                  versionCode = 3
+                  versionName = "1.2-lspatch-stable"
 
                   testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
               }
@@ -56,7 +56,6 @@ jobs:
                       isMinifyEnabled = false
                   }
                   release {
-                      // توقيع نسخة الـ Release بمفتاح Debug تلقائياً ليقبلها LSPatch والنظام فوراً
                       signingConfig = signingConfigs.getByName("debug")
                       isMinifyEnabled = false
                       proguardFiles(
@@ -95,7 +94,7 @@ jobs:
           }
           EOF
 
-          # 2. كتابة كود الموديول UnMockGPS.kt المتوافق مع LSPatch (الوضع المدمج والمحلي)
+          # 2. كتابة كود الموديول UnMockGPS.kt (معالجة الكراش + طابور غير متزامن + حفظ الكراش على القرص قبل موت العملية)
           cat << 'EOF' > app/src/main/java/io/github/khalil212002/unmockgps/UnMockGPS.kt
           package io.github.khalil212002.unmockgps
 
@@ -106,6 +105,7 @@ jobs:
           import android.content.Intent
           import android.location.Location
           import android.os.Bundle
+          import android.os.Process
           import android.util.Log
           import de.robv.android.xposed.IXposedHookLoadPackage
           import de.robv.android.xposed.IXposedHookZygoteInit
@@ -115,7 +115,7 @@ jobs:
           import de.robv.android.xposed.callbacks.XC_LoadPackage
           import java.io.BufferedReader
           import java.io.File
-          import java.io.FileWriter
+          import java.io.FileOutputStream
           import java.io.InputStreamReader
           import java.io.OutputStreamWriter
           import java.io.PrintWriter
@@ -128,6 +128,7 @@ jobs:
           import java.util.concurrent.ConcurrentLinkedQueue
           import java.util.concurrent.CopyOnWriteArrayList
           import java.util.concurrent.atomic.AtomicBoolean
+          import java.util.concurrent.atomic.AtomicInteger
 
           class UnMockGPS : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
@@ -139,24 +140,24 @@ jobs:
                   const val ACTION_LOG_ENTRY = "io.github.khalil212002.unmockgps.ACTION_LOG_ENTRY"
                   const val EXTRA_LOG_LINE = "extra_log_line"
                   const val LOCAL_SERVER_PORT = 45821
-                  private const val MAX_MEMORY_LOGS = 1500
+                  private const val MAX_MEMORY_LOGS = 2000
               }
 
-              private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
               private val isCapturing = ThreadLocal.withInitial { false }
               private val memoryLogs = CopyOnWriteArrayList<String>()
-              private val pendingBroadcasts = ConcurrentLinkedQueue<String>()
+              private val asyncLogQueue = ConcurrentLinkedQueue<String>()
               private val serverStarted = AtomicBoolean(false)
+              private val workerStarted = AtomicBoolean(false)
               private val hooksInstalled = AtomicBoolean(false)
+              private val previousLogsLoaded = AtomicBoolean(false)
+              private val firebaseWarnCounter = AtomicInteger(0)
               @Volatile
               private var appContext: Context? = null
 
               override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam?) {
-                  // مدعوم للتوافق الكامل مع LSPatch و LSPosed معاً
               }
 
               override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
-                  // تجاهل حزمة الموديول نفسه، والسماح للحزمة المستهدفة (أو أي استدعاء من LSPatch داخل التطبيق المدمج)
                   if (lpparam.packageName == MODULE_PACKAGE) return
                   if (lpparam.packageName != TARGET_PACKAGE && !lpparam.packageName.contains("hungerstation", ignoreCase = true)) {
                       return
@@ -164,19 +165,50 @@ jobs:
 
                   if (!hooksInstalled.compareAndSet(false, true)) return
 
-                  // 1. تشغيل الخادم المحلي لنقل السجلات لواجهة التطبيق في وضع LSPatch بدون روت
+                  // 1. تحميل سجلات الجلسة السابقة (للحفاظ على أي Crash حدث قبل إعادة تشغيل التطبيق)
+                  loadPreviousSessionLogs()
+
+                  // 2. تشغيل خيط الكتابة الخلفي لمنع تجميد الواجهة (Skipped frames / ANR)
+                  startAsyncLogWorker()
+
+                  // 3. تشغيل الخادم المحلي لنقل السجلات لواجهة التطبيق
                   startLocalLogServer()
 
-                  // 2. التقاط Context التطبيق في كل من LSPatch (Integrated/Local) و LSPosed
+                  // 4. التقاط Context التطبيق وتنظيف قاعدة بيانات incognia_errors المسببة للكراش
                   hookApplicationContext()
 
-                  captureLog("INFO", MODULE_TAG, "تم تفعيل الموديول عبر LSPatch/Xposed داخل: ${lpparam.packageName}")
+                  captureLog("INFO", MODULE_TAG, "=== بدء جلسة جديدة داخل: ${lpparam.packageName} (PID=${Process.myPid()}) ===")
 
-                  // 3. تفعيل صائد السجلات (Log Catcher)
-                  setupLogCatcher()
+                  // 5. تفعيل صائد السجلات والكراشات (بما في ذلك AndroidRuntime و Sentry/Crashlytics)
+                  setupLogAndCrashCatcher()
 
-                  // 4. تفعيل خطافات تجاوز الموقع الوهمي (Mock Location Bypass)
-                  setupLocationHooks(lpparam)
+                  // 6. تفعيل خطافات الموقع الآمنة (Mock Location Bypass)
+                  setupLocationHooks()
+              }
+
+              private fun formatNow(): String {
+                  return SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
+              }
+
+              private fun getPrimaryInternalLogFile(): File {
+                  val ctx = resolveContext()
+                  if (ctx != null) {
+                      return File(ctx.filesDir, LOG_FILE_NAME)
+                  }
+                  return File("/data/user/0/$TARGET_PACKAGE/files/$LOG_FILE_NAME")
+              }
+
+              private fun loadPreviousSessionLogs() {
+                  if (!previousLogsLoaded.compareAndSet(false, true)) return
+                  try {
+                      val file = getPrimaryInternalLogFile()
+                      if (file.exists() && file.canRead() && file.length() > 0) {
+                          val lines = file.readLines()
+                          val tail = if (lines.size > 600) lines.takeLast(600) else lines
+                          memoryLogs.addAll(tail)
+                      }
+                  } catch (_: Throwable) {
+                  }
               }
 
               private fun hookApplicationContext() {
@@ -187,10 +219,14 @@ jobs:
                           Context::class.java,
                           object : XC_MethodHook() {
                               override fun afterHookedMethod(param: MethodHookParam) {
-                                  val ctx = param.args[0] as? Context ?: return
-                                  if (appContext == null) {
-                                      appContext = ctx.applicationContext ?: ctx
-                                      flushPendingBroadcasts()
+                                  try {
+                                      val ctx = param.args[0] as? Context ?: return
+                                      if (appContext == null) {
+                                          appContext = ctx.applicationContext ?: ctx
+                                          loadPreviousSessionLogs()
+                                          sanitizeIncogniaDatabase(appContext!!)
+                                      }
+                                  } catch (_: Throwable) {
                                   }
                               }
                           }
@@ -203,13 +239,56 @@ jobs:
                           "onCreate",
                           object : XC_MethodHook() {
                               override fun afterHookedMethod(param: MethodHookParam) {
-                                  val app = param.thisObject as? Application ?: return
-                                  appContext = app.applicationContext ?: app
-                                  flushPendingBroadcasts()
+                                  try {
+                                      val app = param.thisObject as? Application ?: return
+                                      appContext = app.applicationContext ?: app
+                                      loadPreviousSessionLogs()
+                                      sanitizeIncogniaDatabase(appContext!!)
+                                  } catch (_: Throwable) {
+                                  }
                               }
                           }
                       )
                   }
+              }
+
+              // إصلاح كراش SQLiteBlobTooBigException: Row too big to fit into CursorWindow (SELECT * FROM incognia_errors)
+              private fun sanitizeIncogniaDatabase(ctx: Context) {
+                  Thread {
+                      try {
+                          val dbList = ctx.databaseList() ?: emptyArray()
+                          for (dbName in dbList) {
+                              if (dbName.contains("incognia", ignoreCase = true)) {
+                                  val deleted = ctx.deleteDatabase(dbName)
+                                  if (deleted) {
+                                      captureLog("HOOK", MODULE_TAG, "تم تنظيف قاعدة بيانات $dbName لمنع كراش CursorWindow")
+                                  }
+                              }
+                          }
+                      } catch (_: Throwable) {
+                      }
+                  }.start()
+              }
+
+              private fun startAsyncLogWorker() {
+                  if (!workerStarted.compareAndSet(false, true)) return
+                  val worker = Thread {
+                      while (!Thread.currentThread().isInterrupted) {
+                          try {
+                              val line = asyncLogQueue.poll()
+                              if (line != null) {
+                                  writeLineToDisk(line, syncImmediately = false)
+                                  dispatchBroadcastIntent(line)
+                              } else {
+                                  Thread.sleep(60L)
+                              }
+                          } catch (_: Throwable) {
+                          }
+                      }
+                  }
+                  worker.isDaemon = true
+                  worker.name = "HS_AsyncLogWorker"
+                  worker.start()
               }
 
               private fun startLocalLogServer() {
@@ -226,11 +305,29 @@ jobs:
                                   val cmd = reader.readLine() ?: "GET"
                                   if (cmd == "CLEAR") {
                                       memoryLogs.clear()
+                                      asyncLogQueue.clear()
                                       clearLocalFiles()
                                       writer.println("CLEARED")
                                   } else {
-                                      for (line in memoryLogs) {
-                                          writer.println(line)
+                                      // إرسال السجلات المحفوظة على القرص أولاً ثم الذاكرة لضمان عدم ضياع أي كراش سابق
+                                      val sentLines = LinkedHashSet<String>()
+                                      try {
+                                          val diskFile = getPrimaryInternalLogFile()
+                                          if (diskFile.exists() && diskFile.canRead()) {
+                                              val diskLines = diskFile.readLines()
+                                              val tail = if (diskLines.size > 1500) diskLines.takeLast(1500) else diskLines
+                                              for (dLine in tail) {
+                                                  if (sentLines.add(dLine)) {
+                                                      writer.println(dLine)
+                                                  }
+                                              }
+                                          }
+                                      } catch (_: Throwable) {
+                                      }
+                                      for (mLine in memoryLogs) {
+                                          if (sentLines.add(mLine)) {
+                                              writer.println(mLine)
+                                          }
                                       }
                                   }
                                   writer.flush()
@@ -247,34 +344,52 @@ jobs:
                   serverThread.start()
               }
 
-              private fun setupLocationHooks(lpparam: XC_LoadPackage.LoadPackageParam) {
+              private fun setupLocationHooks() {
                   val locationClass = Location::class.java
 
-                  // عزل كل Hook في runCatching مستقل لتفادي توقف الموديول على إصدارات أندرويد المختلفة
+                  // إخفاء علامة الموقع الوهمي isMock بأمان تام
                   runCatching {
                       XposedHelpers.findAndHookMethod(locationClass, "isMock", object : XC_MethodHook() {
                           override fun afterHookedMethod(param: MethodHookParam) {
-                              val original = param.result as? Boolean ?: false
-                              param.result = false
-                              captureLog("HOOK", MODULE_TAG, "Location.isMock() تم اعتراضها (الأصل=$original -> false)")
+                              try {
+                                  val original = param.result as? Boolean ?: false
+                                  param.result = false
+                                  if (original) {
+                                      captureLog("HOOK", MODULE_TAG, "Location.isMock() تم اعتراضها (الأصل=true -> false)")
+                                  }
+                              } catch (_: Throwable) {
+                              }
                           }
                       })
                   }
 
+                  // إخفاء علامة المزود الوهمي isFromMockProvider بأمان تام
                   runCatching {
                       XposedHelpers.findAndHookMethod(locationClass, "isFromMockProvider", object : XC_MethodHook() {
                           override fun afterHookedMethod(param: MethodHookParam) {
-                              val original = param.result as? Boolean ?: false
-                              param.result = false
-                              captureLog("HOOK", MODULE_TAG, "Location.isFromMockProvider() تم اعتراضها (الأصل=$original -> false)")
+                              try {
+                                  val original = param.result as? Boolean ?: false
+                                  param.result = false
+                                  if (original) {
+                                      captureLog("HOOK", MODULE_TAG, "Location.isFromMockProvider() تم اعتراضها (الأصل=true -> false)")
+                                  }
+                              } catch (_: Throwable) {
+                              }
                           }
                       })
                   }
 
+                  // تعديل الدقة فقط إذا كانت 0 أو غير موجودة لتفادي كشف القيمة الثابتة
                   runCatching {
                       XposedHelpers.findAndHookMethod(locationClass, "getAccuracy", object : XC_MethodHook() {
                           override fun afterHookedMethod(param: MethodHookParam) {
-                              param.result = 5.0f
+                              try {
+                                  val acc = param.result as? Float ?: 0f
+                                  if (acc <= 0.0f || acc > 100.0f) {
+                                      param.result = 4.5f
+                                  }
+                              } catch (_: Throwable) {
+                              }
                           }
                       })
                   }
@@ -282,35 +397,29 @@ jobs:
                   runCatching {
                       XposedHelpers.findAndHookMethod(locationClass, "hasAccuracy", object : XC_MethodHook() {
                           override fun afterHookedMethod(param: MethodHookParam) {
-                              param.result = true
+                              try {
+                                  param.result = true
+                              } catch (_: Throwable) {
+                              }
                           }
                       })
                   }
 
-                  runCatching {
-                      XposedHelpers.findAndHookMethod(locationClass, "getAltitude", object : XC_MethodHook() {
-                          override fun afterHookedMethod(param: MethodHookParam) {
-                              param.result = 35.0
-                          }
-                      })
-                  }
-
-                  runCatching {
-                      XposedHelpers.findAndHookMethod(locationClass, "hasAltitude", object : XC_MethodHook() {
-                          override fun afterHookedMethod(param: MethodHookParam) {
-                              param.result = true
-                          }
-                      })
-                  }
-
+                  // ملاحظة هامة: تجنب استدعاء containsKey المباشر بدون حماية على getExtras لأنه يرمي BadParcelableException ويسبب كراش
                   runCatching {
                       XposedHelpers.findAndHookMethod(locationClass, "getExtras", object : XC_MethodHook() {
                           override fun afterHookedMethod(param: MethodHookParam) {
-                              val extras = param.result as? Bundle
-                              if (extras != null && extras.containsKey("mockLocation")) {
-                                  extras.remove("mockLocation")
-                                  param.result = extras
-                                  captureLog("HOOK", MODULE_TAG, "Location.getExtras() تم حذف mockLocation من الـ Bundle")
+                              try {
+                                  val extras = param.result as? Bundle ?: return
+                                  extras.classLoader = Location::class.java.classLoader
+                                  if (extras.containsKey("mockLocation")) {
+                                      val copy = Bundle(extras)
+                                      copy.remove("mockLocation")
+                                      param.result = copy
+                                      captureLog("HOOK", MODULE_TAG, "Location.getExtras() تم حذف مفتاح mockLocation بأمان")
+                                  }
+                              } catch (_: Throwable) {
+                                  // تجاهل BadParcelableException حتى لا ينهار التطبيق المستهدف أبداً
                               }
                           }
                       })
@@ -319,7 +428,7 @@ jobs:
                   captureLog("INFO", MODULE_TAG, "تم تفعيل كافة خطافات الموقع (Location Hooks) بنجاح")
               }
 
-              private fun isIgnoredTag(tag: String, msg: String): Boolean {
+              private fun isIgnoredOrSpam(tag: String, msg: String): Boolean {
                   if (tag == MODULE_TAG ||
                       tag.contains("LSPosed", ignoreCase = true) ||
                       tag.contains("LSPatch", ignoreCase = true) ||
@@ -330,10 +439,15 @@ jobs:
                   if (msg.contains(MODULE_TAG)) {
                       return true
                   }
+                  // منع طوفان تحذيرات FirebaseRemoteConfig من إغراق السجل وتبطيء التطبيق
+                  if (tag == "FirebaseRemoteConfig" && msg.contains("An entry in the defaults XML has an invalid key")) {
+                      val count = firebaseWarnCounter.incrementAndGet()
+                      if (count > 2) return true
+                  }
                   return false
               }
 
-              private fun setupLogCatcher() {
+              private fun setupLogAndCrashCatcher() {
                   try {
                       val logClass = Log::class.java
                       val logLevels = mapOf(
@@ -354,11 +468,15 @@ jobs:
                                   String::class.java,
                                   object : XC_MethodHook() {
                                       override fun beforeHookedMethod(param: MethodHookParam) {
-                                          if (isCapturing.get() == true) return
-                                          val tag = param.args[0] as? String ?: "NULL_TAG"
-                                          val msg = param.args[1] as? String ?: ""
-                                          if (!isIgnoredTag(tag, msg)) {
-                                              captureLog(levelName, tag, msg)
+                                          try {
+                                              if (isCapturing.get() == true) return
+                                              val tag = param.args[0] as? String ?: "NULL_TAG"
+                                              val msg = param.args[1] as? String ?: ""
+                                              if (!isIgnoredOrSpam(tag, msg)) {
+                                                  val isFatal = tag == "AndroidRuntime" || levelName == "ERROR" || levelName == "WTF"
+                                                  captureLog(if (tag == "AndroidRuntime") "CRASH" else levelName, tag, msg, null, isFatal)
+                                              }
+                                          } catch (_: Throwable) {
                                           }
                                       }
                                   }
@@ -374,12 +492,16 @@ jobs:
                                   Throwable::class.java,
                                   object : XC_MethodHook() {
                                       override fun beforeHookedMethod(param: MethodHookParam) {
-                                          if (isCapturing.get() == true) return
-                                          val tag = param.args[0] as? String ?: "NULL_TAG"
-                                          val msg = param.args[1] as? String ?: ""
-                                          val tr = param.args[2] as? Throwable
-                                          if (!isIgnoredTag(tag, msg)) {
-                                              captureLog(levelName, tag, msg, tr)
+                                          try {
+                                              if (isCapturing.get() == true) return
+                                              val tag = param.args[0] as? String ?: "NULL_TAG"
+                                              val msg = param.args[1] as? String ?: ""
+                                              val tr = param.args[2] as? Throwable
+                                              if (!isIgnoredOrSpam(tag, msg)) {
+                                                  val isFatal = tag == "AndroidRuntime" || levelName == "ERROR" || levelName == "WTF"
+                                                  captureLog(if (tag == "AndroidRuntime") "CRASH" else levelName, tag, msg, tr, isFatal)
+                                              }
+                                          } catch (_: Throwable) {
                                           }
                                       }
                                   }
@@ -387,49 +509,147 @@ jobs:
                           }
                       }
 
+                      // 1. تثبيت معالج استثناءات شامل يلتقط أي Crash قبل Sentry/Crashlytics ويحفظه فوراً على القرص
+                      runCatching {
+                          val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
+                          Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+                              try {
+                                  captureLog(
+                                      "CRASH",
+                                      "UncaughtException",
+                                      "💥 انهيار التطبيق في الخيط (${thread.name}): ${throwable.javaClass.name}: ${throwable.message}",
+                                      throwable,
+                                      syncDiskImmediately = true
+                                  )
+                              } catch (_: Throwable) {
+                              }
+                              previousHandler?.uncaughtException(thread, throwable)
+                          }
+                      }
+
+                      // 2. اعتراض استبدال DefaultUncaughtExceptionHandler من قبل Sentry أو Crashlytics ليبقى معالجنا نشطاً دائماً
                       runCatching {
                           XposedHelpers.findAndHookMethod(
                               Thread::class.java,
-                              "dispatchUncaughtException",
-                              Throwable::class.java,
+                              "setDefaultUncaughtExceptionHandler",
+                              Thread.UncaughtExceptionHandler::class.java,
                               object : XC_MethodHook() {
                                   override fun beforeHookedMethod(param: MethodHookParam) {
-                                      if (isCapturing.get() == true) return
-                                      val tr = param.args[0] as? Throwable
-                                      captureLog("CRASH", "UncaughtException", "انهيار غير معالج في التطبيق", tr)
+                                      try {
+                                          val originalHandler = param.args[0] as? Thread.UncaughtExceptionHandler ?: return
+                                          param.args[0] = Thread.UncaughtExceptionHandler { thread, throwable ->
+                                              try {
+                                                  captureLog(
+                                                      "CRASH",
+                                                      "UncaughtException",
+                                                      "💥 انهيار التطبيق في الخيط (${thread.name}): ${throwable.javaClass.name}: ${throwable.message}",
+                                                      throwable,
+                                                      syncDiskImmediately = true
+                                                  )
+                                              } catch (_: Throwable) {
+                                              }
+                                              originalHandler.uncaughtException(thread, throwable)
+                                          }
+                                      } catch (_: Throwable) {
+                                      }
                                   }
                               }
                           )
                       }
 
-                      captureLog("INFO", MODULE_TAG, "تم تفعيل صائد السجلات (Log Catcher) بنجاح")
+                      // 3. اعتراض Process.killProcess و System.exit لتسجيل سبب إغلاق التطبيق وحفظ السجل قبل موت العملية
+                      runCatching {
+                          XposedHelpers.findAndHookMethod(
+                              Process::class.java,
+                              "killProcess",
+                              Int::class.javaPrimitiveType,
+                              object : XC_MethodHook() {
+                                  override fun beforeHookedMethod(param: MethodHookParam) {
+                                      try {
+                                          val pid = param.args[0] as? Int ?: 0
+                                          if (pid == Process.myPid()) {
+                                              captureLog(
+                                                  "CRASH",
+                                                  "ProcessKill",
+                                                  "⚠️ تم استدعاء Process.killProcess($pid) لإنهاء التطبيق",
+                                                  RuntimeException("StackTrace for killProcess"),
+                                                  syncDiskImmediately = true
+                                              )
+                                          }
+                                      } catch (_: Throwable) {
+                                      }
+                                  }
+                              }
+                          )
+                      }
+
+                      runCatching {
+                          XposedHelpers.findAndHookMethod(
+                              System::class.java,
+                              "exit",
+                              Int::class.javaPrimitiveType,
+                              object : XC_MethodHook() {
+                                  override fun beforeHookedMethod(param: MethodHookParam) {
+                                      try {
+                                          val status = param.args[0] as? Int ?: 0
+                                          captureLog(
+                                              "CRASH",
+                                              "SystemExit",
+                                              "⚠️ تم استدعاء System.exit($status) لإنهاء التطبيق",
+                                              RuntimeException("StackTrace for System.exit"),
+                                              syncDiskImmediately = true
+                                          )
+                                      } catch (_: Throwable) {
+                                      }
+                                  }
+                              }
+                          )
+                      }
+
+                      captureLog("INFO", MODULE_TAG, "تم تفعيل صائد السجلات والكراشات (Log & Crash Catcher) بنجاح")
                   } catch (e: Throwable) {
                       XposedBridge.log("$MODULE_TAG: Failed to setup log catcher: ${e.message}")
                   }
               }
 
-              private fun captureLog(level: String, tag: String, message: String, throwable: Throwable? = null) {
+              private fun captureLog(
+                  level: String,
+                  tag: String,
+                  message: String,
+                  throwable: Throwable? = null,
+                  syncDiskImmediately: Boolean = false
+              ) {
                   if (isCapturing.get() == true) return
                   isCapturing.set(true)
                   try {
-                      val timestamp = dateFormat.format(Date())
-                      val sb = StringBuilder()
-                      sb.append("[$timestamp] [$level/$tag]: $message")
+                      val timestamp = formatNow()
+                      val FullLines = ArrayList<String>()
+                      val firstLine = "[$timestamp] [$level/$tag]: $message"
+                      FullLines.add(firstLine)
+
                       if (throwable != null) {
                           val sw = StringWriter()
                           throwable.printStackTrace(PrintWriter(sw))
-                          sb.append("\n").append(sw.toString().trimEnd())
+                          val stackLines = sw.toString().trimEnd().lines()
+                          for (sLine in stackLines) {
+                              FullLines.add("[$timestamp] [$level/$tag]:   $sLine")
+                          }
                       }
-                      val formattedLine = sb.toString()
 
-                      if (memoryLogs.size >= MAX_MEMORY_LOGS) {
-                          memoryLogs.removeAt(0)
+                      for (line in FullLines) {
+                          if (memoryLogs.size >= MAX_MEMORY_LOGS) {
+                              memoryLogs.removeAt(0)
+                          }
+                          memoryLogs.add(line)
+
+                          if (syncDiskImmediately) {
+                              // كتابة متزامنة فورية على القرص مع fd.sync() عند حدوث كراش لضمان عدم ضياع السطر قبل موت العملية
+                              writeLineToDisk(line, syncImmediately = true)
+                              dispatchBroadcastIntent(line)
+                          } else {
+                              asyncLogQueue.offer(line)
+                          }
                       }
-                      memoryLogs.add(formattedLine)
-
-                      writeLogToFile(formattedLine)
-                      sendLogBroadcast(formattedLine)
-                      XposedBridge.log("$MODULE_TAG | $formattedLine")
                   } catch (_: Throwable) {
                   } finally {
                       isCapturing.set(false)
@@ -447,25 +667,8 @@ jobs:
                   return appContext
               }
 
-              private fun flushPendingBroadcasts() {
+              private fun dispatchBroadcastIntent(logLine: String) {
                   val ctx = resolveContext() ?: return
-                  while (true) {
-                      val line = pendingBroadcasts.poll() ?: break
-                      dispatchBroadcastIntent(ctx, line)
-                  }
-              }
-
-              private fun sendLogBroadcast(logLine: String) {
-                  val ctx = resolveContext()
-                  if (ctx == null) {
-                      pendingBroadcasts.offer(logLine)
-                      return
-                  }
-                  flushPendingBroadcasts()
-                  dispatchBroadcastIntent(ctx, logLine)
-              }
-
-              private fun dispatchBroadcastIntent(ctx: Context, logLine: String) {
                   try {
                       val intent = Intent(ACTION_LOG_ENTRY).apply {
                           setPackage(MODULE_PACKAGE)
@@ -477,48 +680,36 @@ jobs:
                   }
               }
 
-              private fun getCandidateDirs(): List<File> {
-                  val list = ArrayList<File>()
-                  resolveContext()?.filesDir?.let { list.add(it) }
-                  list.add(File("/data/user/0/$TARGET_PACKAGE/files"))
-                  list.add(File("/data/data/$TARGET_PACKAGE/files"))
-                  list.add(File("/sdcard/Android/media/$TARGET_PACKAGE"))
-                  list.add(File("/sdcard/Download"))
-                  return list
-              }
-
-              private fun writeLogToFile(logLine: String) {
-                  for (dir in getCandidateDirs()) {
-                      try {
-                          if (!dir.exists()) {
-                              dir.mkdirs()
+              @Synchronized
+              private fun writeLineToDisk(logLine: String, syncImmediately: Boolean) {
+                  try {
+                      val file = getPrimaryInternalLogFile()
+                      file.parentFile?.let { if (!it.exists()) it.mkdirs() }
+                      FileOutputStream(file, true).use { fos ->
+                          fos.write((logLine + "\n").toByteArray(Charsets.UTF_8))
+                          fos.flush()
+                          if (syncImmediately) {
+                              fos.fd.sync()
                           }
-                          if (dir.exists() && dir.canWrite()) {
-                              val logFile = File(dir, LOG_FILE_NAME)
-                              FileWriter(logFile, true).use { writer ->
-                                  writer.append(logLine).append("\n")
-                              }
-                          }
-                      } catch (_: Throwable) {
                       }
+                  } catch (_: Throwable) {
                   }
               }
 
+              @Synchronized
               private fun clearLocalFiles() {
-                  for (dir in getCandidateDirs()) {
-                      try {
-                          val logFile = File(dir, LOG_FILE_NAME)
-                          if (logFile.exists() && logFile.canWrite()) {
-                              logFile.writeText("")
-                          }
-                      } catch (_: Throwable) {
+                  try {
+                      val file = getPrimaryInternalLogFile()
+                      if (file.exists() && file.canWrite()) {
+                          file.writeText("")
                       }
+                  } catch (_: Throwable) {
                   }
               }
           }
           EOF
 
-          # 3. كتابة مستقبل البث الثابت LogReceiver.kt
+          # 3. كتابة مستقبل البث الثابت LogReceiver.kt (يعمل في خيط خلفي لعدم تجميد الواجهة)
           cat << 'EOF' > app/src/main/java/io/github/khalil212002/unmockgps/LogReceiver.kt
           package io.github.khalil212002.unmockgps
 
@@ -526,21 +717,29 @@ jobs:
           import android.content.Context
           import android.content.Intent
           import java.io.File
+          import java.util.concurrent.Executors
 
           class LogReceiver : BroadcastReceiver() {
+              companion object {
+                  private val ioExecutor = Executors.newSingleThreadExecutor()
+              }
+
               override fun onReceive(context: Context?, intent: Intent?) {
                   if (context == null || intent?.action != UnMockGPS.ACTION_LOG_ENTRY) return
                   val line = intent.getStringExtra(UnMockGPS.EXTRA_LOG_LINE) ?: return
-                  try {
-                      val internalLog = File(context.filesDir, UnMockGPS.LOG_FILE_NAME)
-                      internalLog.appendText("$line\n")
-                  } catch (_: Throwable) {
+                  val appCtx = context.applicationContext ?: context
+                  ioExecutor.execute {
+                      try {
+                          val internalLog = File(appCtx.filesDir, UnMockGPS.LOG_FILE_NAME)
+                          internalLog.appendText("$line\n")
+                      } catch (_: Throwable) {
+                      }
                   }
               }
           }
           EOF
 
-          # 4. كتابة واجهة المستخدم MainActivity.kt المتوافقة مع LSPatch
+          # 4. كتابة واجهة المستخدم MainActivity.kt (مع زر فلترة الأخطاء والكراشات + حماية الأداء)
           cat << 'EOF' > app/src/main/java/io/github/khalil212002/unmockgps/MainActivity.kt
           package io.github.khalil212002.unmockgps
 
@@ -574,16 +773,20 @@ jobs:
               private lateinit var tvLogContent: TextView
               private lateinit var scrollViewLogs: ScrollView
               private lateinit var btnCopyLog: Button
+              private lateinit var btnFilterCrash: Button
               private lateinit var btnRefreshLog: Button
               private lateinit var btnClearLog: Button
 
-              private val logLines = LinkedHashSet<String>()
+              private val allLogLines = ArrayList<String>()
+              private val seenSet = HashSet<String>()
               private val uiHandler = Handler(Looper.getMainLooper())
+              private var filterImportantOnly = false
+              private var renderPending = false
 
               private val autoRefreshRunnable = object : Runnable {
                   override fun run() {
                       fetchAllLogsAsync(showToast = false)
-                      uiHandler.postDelayed(this, 2000L)
+                      uiHandler.postDelayed(this, 2500L)
                   }
               }
 
@@ -591,8 +794,11 @@ jobs:
                   override fun onReceive(context: Context?, intent: Intent?) {
                       if (intent?.action == UnMockGPS.ACTION_LOG_ENTRY) {
                           val line = intent.getStringExtra(UnMockGPS.EXTRA_LOG_LINE) ?: return
-                          if (logLines.add(line)) {
-                              renderLogs()
+                          synchronized(allLogLines) {
+                              if (seenSet.add(line)) {
+                                  allLogLines.add(line)
+                                  scheduleRender()
+                              }
                           }
                       }
                   }
@@ -606,6 +812,7 @@ jobs:
                   tvLogContent = findViewById(R.id.tvLogContent)
                   scrollViewLogs = findViewById(R.id.scrollViewLogs)
                   btnCopyLog = findViewById(R.id.btnCopyLog)
+                  btnFilterCrash = findViewById(R.id.btnFilterCrash)
                   btnRefreshLog = findViewById(R.id.btnRefreshLog)
                   btnClearLog = findViewById(R.id.btnClearLog)
 
@@ -621,6 +828,12 @@ jobs:
                       val clip = ClipData.newPlainText("HS_Caught_Logs", currentLogs)
                       clipboard.setPrimaryClip(clip)
                       Toast.makeText(this, "تم نسخ السجل إلى الحافظة بنجاح!", Toast.LENGTH_SHORT).show()
+                  }
+
+                  btnFilterCrash.setOnClickListener {
+                      filterImportantOnly = !filterImportantOnly
+                      btnFilterCrash.text = if (filterImportantOnly) "عرض: الكل" else "الأخطاء فقط"
+                      renderLogsNow()
                   }
 
                   btnRefreshLog.setOnClickListener {
@@ -655,33 +868,56 @@ jobs:
                   }
               }
 
-              private fun renderLogs() {
-                  if (logLines.isEmpty()) {
-                      tvLogContent.text = getString(R.string.no_logs_yet)
+              private fun scheduleRender() {
+                  if (renderPending) return
+                  renderPending = true
+                  uiHandler.postDelayed({
+                      renderPending = false
+                      renderLogsNow()
+                  }, 250L)
+              }
+
+              private fun isImportantLine(line: String): Boolean {
+                  return line.contains("[CRASH/") ||
+                      line.contains("[ERROR/") ||
+                      line.contains("[WTF/") ||
+                      line.contains("[HOOK/") ||
+                      line.contains("HS_UnmockGPS") ||
+                      line.contains("Exception") ||
+                      line.contains("Error")
+              }
+
+              private fun renderLogsNow() {
+                  val snapshot: List<String>
+                  synchronized(allLogLines) {
+                      snapshot = if (filterImportantOnly) {
+                          allLogLines.filter { isImportantLine(it) }
+                      } else {
+                          ArrayList(allLogLines)
+                      }
+                  }
+
+                  if (snapshot.isEmpty()) {
+                      tvLogContent.text = if (filterImportantOnly) {
+                          "لا توجد سجلات أخطاء (CRASH / ERROR) أو Hooks حتى الآن."
+                      } else {
+                          getString(R.string.no_logs_yet)
+                      }
                       return
                   }
-                  tvLogContent.text = logLines.joinToString("\n")
+
+                  val displayList = if (snapshot.size > 800) snapshot.takeLast(800) else snapshot
+                  tvLogContent.text = displayList.joinToString("\n")
                   scrollViewLogs.post {
                       scrollViewLogs.fullScroll(View.FOCUS_DOWN)
                   }
-              }
-
-              private fun getCandidateLogFiles(): List<File> {
-                  return listOf(
-                      File(filesDir, UnMockGPS.LOG_FILE_NAME),
-                      File("/sdcard/Android/media/${UnMockGPS.TARGET_PACKAGE}/${UnMockGPS.LOG_FILE_NAME}"),
-                      File("/sdcard/Download/${UnMockGPS.LOG_FILE_NAME}"),
-                      File("/sdcard/Documents/${UnMockGPS.LOG_FILE_NAME}"),
-                      File("/data/user/0/${UnMockGPS.TARGET_PACKAGE}/files/${UnMockGPS.LOG_FILE_NAME}"),
-                      File("/data/data/${UnMockGPS.TARGET_PACKAGE}/files/${UnMockGPS.LOG_FILE_NAME}")
-                  )
               }
 
               private fun fetchAllLogsAsync(showToast: Boolean) {
                   Thread {
                       val collected = ArrayList<String>()
 
-                      // 1. السحب المباشر عبر Localhost Socket من التطبيق المعدل بـ LSPatch (لا يحتاج روت ولا صلاحيات ملفات)
+                      // 1. السحب المباشر عبر Localhost Socket من التطبيق المعدل بـ LSPatch
                       try {
                           Socket().use { socket ->
                               socket.connect(InetSocketAddress("127.0.0.1", UnMockGPS.LOCAL_SERVER_PORT), 800)
@@ -700,28 +936,30 @@ jobs:
                       }
 
                       // 2. قراءة السجلات المستلمة عبر BroadcastReceiver والمحفوظة داخلياً
-                      for (file in getCandidateLogFiles()) {
-                          try {
-                              if (file.exists() && file.canRead() && file.length() > 0) {
-                                  file.forEachLine { line ->
-                                      if (line.isNotBlank()) {
-                                          collected.add(line)
-                                      }
+                      try {
+                          val internalFile = File(filesDir, UnMockGPS.LOG_FILE_NAME)
+                          if (internalFile.exists() && internalFile.canRead() && internalFile.length() > 0) {
+                              internalFile.forEachLine { line ->
+                                  if (line.isNotBlank()) {
+                                      collected.add(line)
                                   }
                               }
-                          } catch (_: Throwable) {
                           }
+                      } catch (_: Throwable) {
                       }
 
                       uiHandler.post {
                           var changed = false
-                          for (item in collected) {
-                              if (logLines.add(item)) {
-                                  changed = true
+                          synchronized(allLogLines) {
+                              for (item in collected) {
+                                  if (seenSet.add(item)) {
+                                      allLogLines.add(item)
+                                      changed = true
+                                  }
                               }
                           }
-                          if (changed || logLines.isEmpty()) {
-                              renderLogs()
+                          if (changed || allLogLines.isEmpty()) {
+                              renderLogsNow()
                           }
                           if (showToast) {
                               Toast.makeText(this, "تم تحديث السجل", Toast.LENGTH_SHORT).show()
@@ -731,7 +969,10 @@ jobs:
               }
 
               private fun clearLogs() {
-                  logLines.clear()
+                  synchronized(allLogLines) {
+                      allLogLines.clear()
+                      seenSet.clear()
+                  }
                   tvLogContent.text = getString(R.string.no_logs_yet)
 
                   Thread {
@@ -744,13 +985,12 @@ jobs:
                       } catch (_: Throwable) {
                       }
 
-                      for (file in getCandidateLogFiles()) {
-                          try {
-                              if (file.exists() && file.canWrite()) {
-                                  file.writeText("")
-                              }
-                          } catch (_: Throwable) {
+                      try {
+                          val internalFile = File(filesDir, UnMockGPS.LOG_FILE_NAME)
+                          if (internalFile.exists() && internalFile.canWrite()) {
+                              internalFile.writeText("")
                           }
+                      } catch (_: Throwable) {
                       }
                   }.start()
 
@@ -768,7 +1008,7 @@ jobs:
           }
           EOF
 
-          # 5. كتابة ملف تخطيط الواجهة activity_main.xml
+          # 5. كتابة ملف تخطيط الواجهة activity_main.xml (مع زر فلترة الأخطاء)
           cat << 'EOF' > app/src/main/res/layout/activity_main.xml
           <?xml version="1.0" encoding="utf-8"?>
           <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
@@ -807,18 +1047,29 @@ jobs:
                       android:id="@+id/btnCopyLog"
                       android:layout_width="0dp"
                       android:layout_height="wrap_content"
-                      android:layout_weight="1.5"
-                      android:text="Copy Log"
+                      android:layout_weight="1.2"
+                      android:text="Copy"
                       android:textAllCaps="false"
                       android:backgroundTint="#2196F3"
+                      android:textColor="#FFFFFF" />
+
+                  <Button
+                      android:id="@+id/btnFilterCrash"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1.3"
+                      android:layout_marginStart="6dp"
+                      android:text="الأخطاء فقط"
+                      android:textAllCaps="false"
+                      android:backgroundTint="#FF9800"
                       android:textColor="#FFFFFF" />
 
                   <Button
                       android:id="@+id/btnRefreshLog"
                       android:layout_width="0dp"
                       android:layout_height="wrap_content"
-                      android:layout_weight="1"
-                      android:layout_marginStart="8dp"
+                      android:layout_weight="1.1"
+                      android:layout_marginStart="6dp"
                       android:text="Refresh"
                       android:textAllCaps="false"
                       android:backgroundTint="#424242"
@@ -829,7 +1080,7 @@ jobs:
                       android:layout_width="0dp"
                       android:layout_height="wrap_content"
                       android:layout_weight="1"
-                      android:layout_marginStart="8dp"
+                      android:layout_marginStart="6dp"
                       android:text="Clear"
                       android:textAllCaps="false"
                       android:backgroundTint="#D32F2F"
@@ -876,7 +1127,7 @@ jobs:
           </resources>
           EOF
 
-          # 7. تحديث ملف AndroidManifest.xml بخصائص LSPatch الحديثة
+          # 7. تحديث ملف AndroidManifest.xml
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
