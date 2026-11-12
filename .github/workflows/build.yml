@@ -281,15 +281,15 @@ jobs:
                           "attachBaseContext",
                           Context::class.java,
                           object : XC_MethodHook() {
-                              override fun beforeHookedMethod(param: MethodHookParam) {
+                              override fun afterHookedMethod(param: MethodHookParam) {
                                   try {
                                       val ctx = param.args[0] as? Context ?: return
                                       if (appContext == null) {
                                           appContext = ctx.applicationContext ?: ctx
                                           loadPreviousSessionLogs()
                                           sanitizeIncogniaDatabase(appContext!!)
+                                          setupIntegrityHooks(lpparam)
                                       }
-                                      setupIntegrityHooks(lpparam, ctx.classLoader)
                                   } catch (_: Throwable) {
                                   }
                               }
@@ -302,13 +302,13 @@ jobs:
                           Application::class.java,
                           "onCreate",
                           object : XC_MethodHook() {
-                              override fun beforeHookedMethod(param: MethodHookParam) {
+                              override fun afterHookedMethod(param: MethodHookParam) {
                                   try {
                                       val app = param.thisObject as? Application ?: return
                                       appContext = app.applicationContext ?: app
                                       loadPreviousSessionLogs()
                                       sanitizeIncogniaDatabase(appContext!!)
-                                      setupIntegrityHooks(lpparam, app.classLoader)
+                                      setupIntegrityHooks(lpparam)
                                   } catch (_: Throwable) {
                                   }
                               }
@@ -319,8 +319,40 @@ jobs:
 
               private val integrityHooked = AtomicBoolean(false)
               private val coroutineIntegrityHooked = AtomicBoolean(false)
-              private fun setupIntegrityHooks(lpparam: XC_LoadPackage.LoadPackageParam, customClassLoader: ClassLoader? = null) {
-                  val classLoader = customClassLoader ?: resolveContext()?.classLoader ?: lpparam.classLoader ?: return
+              private val rootFilesHooked = AtomicBoolean(false)
+              private fun setupIntegrityHooks(lpparam: XC_LoadPackage.LoadPackageParam) {
+                  val classLoader = resolveContext()?.classLoader ?: lpparam.classLoader ?: return
+
+                  // 0. إخفاء ملفات الروت و Build.TAGS حتى ينجح فحص verifyRootIntegrity طبيعياً دون تعطيل تسجيل الدخول
+                  if (rootFilesHooked.compareAndSet(false, true)) {
+                      runCatching {
+                          val buildClass = android.os.Build::class.java
+                          val tagsField = buildClass.getDeclaredField("TAGS")
+                          tagsField.isAccessible = true
+                          val currentTags = tagsField.get(null) as? String
+                          if (currentTags != null && currentTags.contains("test-keys")) {
+                              tagsField.set(null, "release-keys")
+                          }
+                      }
+                      runCatching {
+                          val rootIndicators = listOf(
+                              "/su", "/magisk", "/busybox", "superuser.apk",
+                              "xposed", "lsposed", "lspatch", "edxposed", "kernelsu", "apatch"
+                          )
+                          XposedHelpers.findAndHookMethod(File::class.java, "exists", object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  val f = param.thisObject as? File ?: return
+                                  val p = f.path.lowercase(Locale.ROOT)
+                                  if (p == "/system/bin/su" || p == "/system/xbin/su" || p == "/sbin/su" ||
+                                      p == "/data/local/xbin/su" || p == "/data/local/bin/su" || p == "/data/local/su" ||
+                                      p == "/su/bin/su" || rootIndicators.any { p.endsWith(it) || p.contains("/magisk") }
+                                  ) {
+                                      param.result = false
+                                  }
+                              }
+                          })
+                      }
+                  }
 
                   // 1. اعتراض دالة verifyRootIntegrity المباشرة في RiderSupportFeaturesImpl
                   runCatching {
@@ -338,13 +370,14 @@ jobs:
                                       Void.TYPE -> null
                                       else -> kotlin.Unit
                                   }
-                                  captureLog("HOOK", MODULE_TAG, "🛡️ تم تجاوز RiderSupportFeaturesImpl.verifyRootIntegrity من البداية")
+                                  captureLog("HOOK", MODULE_TAG, "🛡️ تم تجاوز RiderSupportFeaturesImpl.verifyRootIntegrity بأمان")
                               }
                           })
                       }
                   }
 
-                  // 2. إيقاف الكوروتين verifyRootIntegrity$1.invokeSuspend في beforeHookedMethod قبل تنفيذ الكراش المتعمد (OOM 622MB / divide by zero)
+                  // 2. اعتراض الكوروتين verifyRootIntegrity$1.invokeSuspend في afterHookedMethod فقط عند حدوث استثناء
+                  // (مهم جداً: عدم استخدام beforeHookedMethod هنا لأن إرجاع kotlin.Unit عند label=0 يعطل الكوروتين ويمنع تسجيل الدخول)
                   runCatching {
                       val coroutineCls = XposedHelpers.findClassIfExists(
                           "com.roadrunner.rider.support.implementation.RiderSupportFeaturesImpl\$verifyRootIntegrity\$1",
@@ -352,12 +385,9 @@ jobs:
                       )
                       if (coroutineCls != null && coroutineIntegrityHooked.compareAndSet(false, true)) {
                           XposedBridge.hookAllMethods(coroutineCls, "invokeSuspend", object : XC_MethodHook() {
-                              override fun beforeHookedMethod(param: MethodHookParam) {
-                                  param.result = kotlin.Unit
-                                  captureLog("HOOK", MODULE_TAG, "🛡️ تم إحباط تنفيذ verifyRootIntegrity\$1.invokeSuspend مسبقاً (منع OOM و divide by zero)")
-                              }
                               override fun afterHookedMethod(param: MethodHookParam) {
                                   if (param.throwable != null) {
+                                      captureLog("HOOK", MODULE_TAG, "🛡️ تم إخماد استثناء داخل verifyRootIntegrity\$1: ${param.throwable.message}")
                                       param.throwable = null
                                       param.result = kotlin.Unit
                                   }
@@ -699,6 +729,21 @@ jobs:
                                       val pkg = item.packageName?.lowercase(Locale.ROOT) ?: continue
                                       if (SUSPICIOUS_PACKAGE_KEYWORDS.any { pkg.contains(it) }) {
                                           iterator.remove()
+                                      }
+                                  }
+                              }
+                          })
+                          XposedBridge.hookAllMethods(apmClass, "getPackageInfo", object : XC_MethodHook() {
+                              override fun afterHookedMethod(param: MethodHookParam) {
+                                  val pkgInfo = param.result as? PackageInfo ?: return
+                                  val pkg = pkgInfo.packageName ?: return
+                                  if (pkg == "com.google.android.gms") {
+                                      @Suppress("DEPRECATION")
+                                      if (pkgInfo.versionCode in 1..264431034) {
+                                          pkgInfo.versionCode = 264431035
+                                          if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                                              pkgInfo.longVersionCode = 264431035L
+                                          }
                                       }
                                   }
                               }
