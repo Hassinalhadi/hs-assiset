@@ -1182,7 +1182,7 @@ jobs:
                                   val pb = param.thisObject as? ProcessBuilder ?: return
                                   val cmdStr = pb.command()?.joinToString(" ")?.lowercase(Locale.ROOT) ?: return
                                   if (badCmds.any { cmdStr == it || cmdStr.contains("/$it") || cmdStr.contains(" $it") }) {
-                                      param.throwable = IOException("Cannot run program "$cmdStr": error=13, Permission denied")
+                                      param.throwable = IOException("Cannot run program $cmdStr: error=13, Permission denied")
                                   }
                               }
                           })
@@ -1197,7 +1197,7 @@ jobs:
                                       else -> return
                                   }.lowercase(Locale.ROOT)
                                   if (badCmds.any { cmdStr == it || cmdStr.contains("/$it") || cmdStr.contains(" $it") }) {
-                                      param.throwable = IOException("Cannot run program "$cmdStr": error=13, Permission denied")
+                                      param.throwable = IOException("Cannot run program $cmdStr: error=13, Permission denied")
                                   }
                               }
                           })
