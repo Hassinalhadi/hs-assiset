@@ -155,7 +155,9 @@ jobs:
           import java.io.InputStreamReader
           import java.io.OutputStreamWriter
           import java.io.PrintWriter
+          import java.io.IOException
           import java.io.StringWriter
+          import java.security.MessageDigest
           import java.net.InetAddress
           import java.net.ServerSocket
           import java.text.SimpleDateFormat
@@ -335,6 +337,13 @@ jobs:
               private val cronetHooked = AtomicBoolean(false)
               private val hookedRuntimeCallClasses = Collections.synchronizedSet(HashSet<Class<*>>())
               private val ial403Logged = AtomicBoolean(false)
+          private val classHideHooked = AtomicBoolean(false)
+          private val stackScrubHooked = AtomicBoolean(false)
+          private val procMapsHooked = AtomicBoolean(false)
+          private val execHideHooked = AtomicBoolean(false)
+          private val isSelfClassLookup = ThreadLocal.withInitial { false }
+          private val isScrubbingStack = ThreadLocal.withInitial { false }
+          private val isFilteringProc = ThreadLocal.withInitial { false }
               private fun setupIntegrityHooks(lpparam: XC_LoadPackage.LoadPackageParam) {
                   val classLoader = resolveContext()?.classLoader ?: lpparam.classLoader ?: return
 
@@ -354,18 +363,33 @@ jobs:
                               "/su", "/magisk", "/busybox", "superuser.apk",
                               "xposed", "lsposed", "lspatch", "edxposed", "kernelsu", "apatch"
                           )
-                          XposedHelpers.findAndHookMethod(File::class.java, "exists", object : XC_MethodHook() {
-                              override fun beforeHookedMethod(param: MethodHookParam) {
-                                  val f = param.thisObject as? File ?: return
-                                  val p = f.path.lowercase(Locale.ROOT)
-                                  if (p == "/system/bin/su" || p == "/system/xbin/su" || p == "/sbin/su" ||
-                                      p == "/data/local/xbin/su" || p == "/data/local/bin/su" || p == "/data/local/su" ||
-                                      p == "/su/bin/su" || rootIndicators.any { p.endsWith(it) || p.contains("/magisk") }
-                                  ) {
-                                      param.result = false
-                                  }
+                          fun isHiddenPath(f: File?): Boolean {
+                              val p = f?.path?.lowercase(Locale.ROOT) ?: return false
+                              if (p.contains(LOG_FILE_NAME)) return false
+                              return p == "/system/bin/su" || p == "/system/xbin/su" || p == "/sbin/su" ||
+                                  p == "/data/local/xbin/su" || p == "/data/local/bin/su" || p == "/data/local/su" ||
+                                  p == "/su/bin/su" || rootIndicators.any { p.endsWith(it) || p.contains("/magisk") || p.contains("/lspatch") || p.contains("/lsposed") }
+                          }
+                          for (boolMethod in listOf("exists", "canRead", "canExecute", "isFile", "isDirectory")) {
+                              runCatching {
+                                  XposedHelpers.findAndHookMethod(File::class.java, boolMethod, object : XC_MethodHook() {
+                                      override fun beforeHookedMethod(param: MethodHookParam) {
+                                          if (isHiddenPath(param.thisObject as? File)) {
+                                              param.result = false
+                                          }
+                                      }
+                                  })
                               }
-                          })
+                          }
+                          runCatching {
+                              XposedHelpers.findAndHookMethod(File::class.java, "length", object : XC_MethodHook() {
+                                  override fun beforeHookedMethod(param: MethodHookParam) {
+                                      if (isHiddenPath(param.thisObject as? File)) {
+                                          param.result = 0L
+                                      }
+                                  }
+                              })
+                          }
                       }
                   }
 
@@ -484,8 +508,11 @@ jobs:
                   // 4.4 خطافات كشف OkHttp المشفر (FirebasePerfOkHttpClient) + WebView + DNS
                   setupDeepNetworkDiscoveryHooks(classLoader)
 
-                  // 4.5 تشخيص Play Integrity ومسار الحزمة الفعلي
+                  // 4.5 تشخيص Play Integrity ومسار الحزمة الفعلي والتوقيع
                   setupPlayIntegrityDiagnostics(classLoader)
+
+                  // 4.6 إخفاء فئات Xposed/LSPatch، تنظيف StackTrace، تصفية /proc/self/maps، ومنع أوامر su/magisk
+                  setupAntiTamperBypassHooks(classLoader)
               }
 
               private fun shouldLogNetworkUrl(url: String, code: Int): Boolean {
@@ -970,7 +997,27 @@ jobs:
                           val ctx = resolveContext()
                           if (ctx != null && apkPathDiagLogged.compareAndSet(false, true)) {
                               val splits = ctx.applicationInfo?.splitSourceDirs?.joinToString(", ") ?: "none"
-                              captureLog("HOOK", MODULE_TAG, "🔍 [Diag] apk=${ctx.packageCodePath} | splits=$splits", null)
+                              val certInfo = runCatching {
+                                  @Suppress("DEPRECATION")
+                                  val pi = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                                      ctx.packageManager.getPackageInfo(TARGET_PACKAGE, PackageManager.GET_SIGNING_CERTIFICATES)
+                                  } else {
+                                      ctx.packageManager.getPackageInfo(TARGET_PACKAGE, PackageManager.GET_SIGNATURES)
+                                  }
+                                  val sigs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                                      pi.signingInfo?.apkContentsSigners ?: pi.signingInfo?.signingCertificateHistory
+                                  } else {
+                                      @Suppress("DEPRECATION")
+                                      pi.signatures
+                                  }
+                                  val first = sigs?.firstOrNull()
+                                  if (first != null) {
+                                      val digest = MessageDigest.getInstance("SHA-256").digest(first.toByteArray())
+                                      val sha256 = digest.joinToString("") { "%02x".format(it) }
+                                      "hash=${first.hashCode()} sha256=${sha256.take(16)}..."
+                                  } else "none"
+                              }.getOrElse { "err=${it.message}" }
+                              captureLog("HOOK", MODULE_TAG, "🔍 [Diag] apk=${ctx.packageCodePath} | splits=$splits | cert=($certInfo)", null)
                           }
                       }
                   }
@@ -994,6 +1041,164 @@ jobs:
                               override fun afterHookedMethod(param: MethodHookParam) {
                                   val err = param.thisObject as? Throwable
                                   captureLog("ERROR", MODULE_TAG, "🚨 [PlayIntegrity Error] ${err?.message}", err, syncDiskImmediately = true)
+                              }
+                          })
+                      }
+                  }
+              }
+
+              private fun setupAntiTamperBypassHooks(classLoader: ClassLoader) {
+                  val hiddenKeywords = listOf(
+                      "de.robv.android.xposed",
+                      "org.lsposed",
+                      "io.github.lsposed",
+                      "lspatch",
+                      "lsposed",
+                      "edxposed",
+                      "lsphooker_",
+                      "edhooker_",
+                      "unmockgps"
+                  )
+
+                  // 1. منع كشف كلاسات Xposed/LSPatch عبر Class.forName و ClassLoader.loadClass
+                  if (classHideHooked.compareAndSet(false, true)) {
+                      runCatching {
+                          XposedBridge.hookAllMethods(Class::class.java, "forName", object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  if (isSelfClassLookup.get() == true || isCapturing.get() == true) return
+                                  val name = (param.args.firstOrNull() as? String)?.lowercase(Locale.ROOT) ?: return
+                                  if (hiddenKeywords.any { name.contains(it) }) {
+                                      param.throwable = ClassNotFoundException(name)
+                                  }
+                              }
+                          })
+                      }
+                      runCatching {
+                          XposedHelpers.findAndHookMethod(
+                              ClassLoader::class.java,
+                              "loadClass",
+                              String::class.java,
+                              Boolean::class.javaPrimitiveType,
+                              object : XC_MethodHook() {
+                                  override fun beforeHookedMethod(param: MethodHookParam) {
+                                      if (isSelfClassLookup.get() == true || isCapturing.get() == true) return
+                                      val name = (param.args.firstOrNull() as? String)?.lowercase(Locale.ROOT) ?: return
+                                      if (hiddenKeywords.any { name.contains(it) }) {
+                                          param.throwable = ClassNotFoundException(name)
+                                      }
+                                  }
+                              }
+                          )
+                      }
+                  }
+
+                  // 2. تنظيف StackTrace من آثار Xposed/LSPHooker عند فحصها بواسطة Incognia أو الحماية
+                  if (stackScrubHooked.compareAndSet(false, true)) {
+                      val scrubCb = object : XC_MethodHook() {
+                          override fun afterHookedMethod(param: MethodHookParam) {
+                              if (isCapturing.get() == true || isScrubbingStack.get() == true) return
+                              val arr = param.result as? Array<*> ?: return
+                              isScrubbingStack.set(true)
+                              try {
+                                  var dirty = false
+                                  for (item in arr) {
+                                      val ste = item as? StackTraceElement ?: continue
+                                      val cls = ste.className.lowercase(Locale.ROOT)
+                                      if (hiddenKeywords.any { cls.contains(it) }) {
+                                          dirty = true
+                                          break
+                                      }
+                                  }
+                                  if (dirty) {
+                                      val filtered = ArrayList<StackTraceElement>(arr.size)
+                                      for (item in arr) {
+                                          val ste = item as? StackTraceElement ?: continue
+                                          val cls = ste.className.lowercase(Locale.ROOT)
+                                          if (!hiddenKeywords.any { cls.contains(it) }) {
+                                              filtered.add(ste)
+                                          }
+                                      }
+                                      param.result = filtered.toTypedArray()
+                                  }
+                              } finally {
+                                  isScrubbingStack.set(false)
+                              }
+                          }
+                      }
+                      runCatching { XposedHelpers.findAndHookMethod(Throwable::class.java, "getStackTrace", scrubCb) }
+                      runCatching { XposedHelpers.findAndHookMethod(Thread::class.java, "getStackTrace", scrubCb) }
+                  }
+
+                  // 3. تصفية مخرجات /proc/self/maps و /proc/self/mountinfo و TracerPid أثناء القراءة
+                  if (procMapsHooked.compareAndSet(false, true)) {
+                      runCatching {
+                          XposedHelpers.findAndHookMethod(BufferedReader::class.java, "readLine", object : XC_MethodHook() {
+                              override fun afterHookedMethod(param: MethodHookParam) {
+                                  if (isCapturing.get() == true || isFilteringProc.get() == true) return
+                                  val line = param.result as? String ?: return
+                                  val lower = line.lowercase(Locale.ROOT)
+                                  if (lower.startsWith("tracerpid:") && !lower.endsWith("	0") && !lower.endsWith(" 0")) {
+                                      param.result = "TracerPid:	0"
+                                      return
+                                  }
+                                  if (lower.contains("lspatch") || lower.contains("lsposed") || lower.contains("xposed") ||
+                                      lower.contains("magisk") || lower.contains("zygisk") || lower.contains("riru") ||
+                                      lower.contains("frida")
+                                  ) {
+                                      isFilteringProc.set(true)
+                                      try {
+                                          val br = param.thisObject as? BufferedReader ?: return
+                                          var next: String?
+                                          while (true) {
+                                              next = br.readLine()
+                                              if (next == null) {
+                                                  param.result = null
+                                                  break
+                                              }
+                                              val nl = next.lowercase(Locale.ROOT)
+                                              if (!nl.contains("lspatch") && !nl.contains("lsposed") && !nl.contains("xposed") &&
+                                                  !nl.contains("magisk") && !nl.contains("zygisk") && !nl.contains("riru") &&
+                                                  !nl.contains("frida")
+                                              ) {
+                                                  param.result = next
+                                                  break
+                                              }
+                                          }
+                                      } finally {
+                                          isFilteringProc.set(false)
+                                      }
+                                  }
+                              }
+                          })
+                      }
+                  }
+
+                  // 4. منع تنفيذ أوامر فحص الروت (su, which, magisk, busybox)
+                  if (execHideHooked.compareAndSet(false, true)) {
+                      val badCmds = listOf("su", "magisk", "busybox", "ksud", "apd")
+                      runCatching {
+                          XposedHelpers.findAndHookMethod(ProcessBuilder::class.java, "start", object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  val pb = param.thisObject as? ProcessBuilder ?: return
+                                  val cmdStr = pb.command()?.joinToString(" ")?.lowercase(Locale.ROOT) ?: return
+                                  if (badCmds.any { cmdStr == it || cmdStr.contains("/$it") || cmdStr.contains(" $it") }) {
+                                      param.throwable = IOException("Cannot run program "$cmdStr": error=13, Permission denied")
+                                  }
+                              }
+                          })
+                      }
+                      runCatching {
+                          XposedBridge.hookAllMethods(Runtime::class.java, "exec", object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  val first = param.args.firstOrNull()
+                                  val cmdStr = when (first) {
+                                      is String -> first
+                                      is Array<*> -> first.joinToString(" ")
+                                      else -> return
+                                  }.lowercase(Locale.ROOT)
+                                  if (badCmds.any { cmdStr == it || cmdStr.contains("/$it") || cmdStr.contains(" $it") }) {
+                                      param.throwable = IOException("Cannot run program "$cmdStr": error=13, Permission denied")
+                                  }
                               }
                           })
                       }
