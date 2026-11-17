@@ -633,17 +633,90 @@ jobs:
                   }
               }
 
-              private fun setupCronetHooks(classLoader: ClassLoader) {
-                  if (cronetHooked.get()) return
+              private val hookedCronetCallbacks = Collections.synchronizedSet(HashSet<Class<*>>())
+              private val jsonHooked = AtomicBoolean(false)
+
+              private fun hookCronetCallbackClass(cbCls: Class<*>) {
+                  if (!hookedCronetCallbacks.add(cbCls)) return
                   runCatching {
-                      val cronetReqCls = XposedHelpers.findClassIfExists("org.chromium.net.impl.CronetUrlRequest", classLoader)
-                          ?: XposedHelpers.findClassIfExists("org.chromium.net.UrlRequest", classLoader)
-                      if (cronetReqCls != null) {
-                          val cbCls = XposedHelpers.findClassIfExists("org.chromium.net.UrlRequest\$Callback", classLoader)
-                          if (cbCls != null) {
-                              cronetHooked.set(true)
-                              captureLog("HOOK", MODULE_TAG, "ℹ️ تم رصد فئة Cronet (${cronetReqCls.name})")
+                      XposedBridge.hookAllMethods(cbCls, "onResponseStarted", object : XC_MethodHook() {
+                          override fun beforeHookedMethod(param: MethodHookParam) {
+                              val info = param.args.getOrNull(1) ?: return
+                              val code = runCatching { XposedHelpers.callMethod(info, "getHttpStatusCode") as? Int }.getOrNull() ?: return
+                              val url = runCatching { XposedHelpers.callMethod(info, "getUrl") as? String }.getOrNull() ?: ""
+                              if (shouldLogNetworkUrl(url, code)) {
+                                  captureLog(
+                                      if (code >= 400) "ERROR" else "INFO",
+                                      MODULE_TAG,
+                                      "🌐 [Cronet] HTTP $code -> $url",
+                                      null,
+                                      syncDiskImmediately = (code >= 400)
+                                  )
+                              }
                           }
+                      })
+                      XposedBridge.hookAllMethods(cbCls, "onFailed", object : XC_MethodHook() {
+                          override fun beforeHookedMethod(param: MethodHookParam) {
+                              val info = param.args.getOrNull(1)
+                              val err = param.args.getOrNull(2) as? Throwable
+                              val url = runCatching { XposedHelpers.callMethod(info, "getUrl") as? String }.getOrNull() ?: "unknown"
+                              captureLog(
+                                  "ERROR",
+                                  MODULE_TAG,
+                                  "🌐 [Cronet] Failed -> $url | ${err?.message}",
+                                  err,
+                                  syncDiskImmediately = true
+                              )
+                          }
+                      })
+                  }
+              }
+
+              private fun setupCronetHooks(classLoader: ClassLoader) {
+                  if (!cronetHooked.get()) {
+                      var anyHooked = false
+                      for (engineName in listOf("org.chromium.net.CronetEngine", "org.chromium.net.ExperimentalCronetEngine")) {
+                          runCatching {
+                              val engineCls = XposedHelpers.findClassIfExists(engineName, classLoader) ?: return@runCatching
+                              val unhooks = XposedBridge.hookAllMethods(engineCls, "newUrlRequestBuilder", object : XC_MethodHook() {
+                                  override fun beforeHookedMethod(param: MethodHookParam) {
+                                      val cb = param.args.getOrNull(1) ?: return
+                                      hookCronetCallbackClass(cb.javaClass)
+                                  }
+                              })
+                              if (unhooks.isNotEmpty()) anyHooked = true
+                          }
+                      }
+                      if (anyHooked) {
+                          cronetHooked.set(true)
+                          captureLog("HOOK", MODULE_TAG, "✅ تم تفعيل خطاف Cronet (newUrlRequestBuilder) بنجاح")
+                      }
+                  }
+
+                  if (jsonHooked.compareAndSet(false, true)) {
+                      runCatching {
+                          XposedHelpers.findAndHookConstructor(
+                              org.json.JSONObject::class.java,
+                              String::class.java,
+                              object : XC_MethodHook() {
+                                  override fun afterHookedMethod(param: MethodHookParam) {
+                                      if (isCapturing.get() == true) return
+                                      val raw = param.args.firstOrNull() as? String ?: return
+                                      if (raw.length in 10..3000 &&
+                                          (raw.contains("IAL403", true) || raw.contains("403") || raw.contains("integrity", true) || raw.contains("unauthorized", true)) &&
+                                          !raw.contains("braze", true) && !raw.contains("mapbox", true) && !raw.contains("gtm", true)
+                                      ) {
+                                          captureLog(
+                                              "HOOK",
+                                              MODULE_TAG,
+                                              "📦 [JSON] $raw",
+                                              null,
+                                              syncDiskImmediately = raw.contains("IAL403", true)
+                                          )
+                                      }
+                                  }
+                              }
+                          )
                       }
                   }
               }
