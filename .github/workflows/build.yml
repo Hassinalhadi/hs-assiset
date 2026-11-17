@@ -483,6 +483,9 @@ jobs:
 
                   // 4.4 خطافات كشف OkHttp المشفر (FirebasePerfOkHttpClient) + WebView + DNS
                   setupDeepNetworkDiscoveryHooks(classLoader)
+
+                  // 4.5 تشخيص Play Integrity ومسار الحزمة الفعلي
+                  setupPlayIntegrityDiagnostics(classLoader)
               }
 
               private fun shouldLogNetworkUrl(url: String, code: Int): Boolean {
@@ -841,26 +844,50 @@ jobs:
                                                               val code = extractStatusCode(resp) ?: -1
                                                               val respStr = extractUrlHint(resp).ifEmpty { extractUrlHint(c) }
                                                               if (code >= 400 || shouldLogNetworkUrl(respStr, code)) {
-                                                                  var errBody = ""
+                                                                  var errDetails = ""
                                                                   if (code >= 400) {
-                                                                      errBody = runCatching {
+                                                                      errDetails = runCatching {
+                                                                          val sb = StringBuilder()
+                                                                          // 1. استخراج الترويسات (Headers) من كائن Response
+                                                                          for (f in resp.javaClass.declaredFields) {
+                                                                              f.isAccessible = true
+                                                                              val v = f.get(resp) ?: continue
+                                                                              val vs = v.toString()
+                                                                              if (vs.contains(":") && vs.contains("\n") && vs.length < 1500) {
+                                                                                  sb.append(" | headers=").append(vs.replace("\n", "; "))
+                                                                                  break
+                                                                              }
+                                                                          }
+                                                                          // 2. استخراج نص الرد (Body) عبر peekBody مع تجنب toString
                                                                           val peekMethod = resp.javaClass.declaredMethods.firstOrNull {
                                                                               it.parameterCount == 1 && it.parameterTypes[0] == Long::class.javaPrimitiveType && !it.returnType.isPrimitive
                                                                           }
                                                                           peekMethod?.isAccessible = true
-                                                                          val bodyObj = peekMethod?.invoke(resp, 2048L)
-                                                                          val strMethod = bodyObj?.javaClass?.declaredMethods?.firstOrNull {
-                                                                              it.parameterCount == 0 && it.returnType == String::class.java
+                                                                          val bodyObj = peekMethod?.invoke(resp, 4096L)
+                                                                          if (bodyObj != null) {
+                                                                              var foundBody = ""
+                                                                              for (m in bodyObj.javaClass.methods) {
+                                                                                  if (m.parameterCount == 0 && m.returnType == String::class.java && m.name != "toString") {
+                                                                                      val candidate = runCatching {
+                                                                                          m.isAccessible = true
+                                                                                          m.invoke(bodyObj) as? String
+                                                                                      }.getOrNull() ?: continue
+                                                                                      if (candidate.isNotBlank() && (candidate.startsWith("{") || candidate.startsWith("[") || candidate.length > foundBody.length)) {
+                                                                                          foundBody = candidate
+                                                                                      }
+                                                                                  }
+                                                                              }
+                                                                              if (foundBody.isNotEmpty()) {
+                                                                                  sb.append(" | body=").append(foundBody.take(1500))
+                                                                              }
                                                                           }
-                                                                          strMethod?.isAccessible = true
-                                                                          strMethod?.invoke(bodyObj) as? String ?: ""
+                                                                          sb.toString()
                                                                       }.getOrNull() ?: ""
                                                                   }
-                                                                  val bodySuffix = if (errBody.isNotEmpty()) " | body=$errBody" else ""
                                                                   captureLog(
                                                                       if (code >= 400) "ERROR" else "INFO",
                                                                       MODULE_TAG,
-                                                                      "🌐 [FP-OkHttp.resp] code=$code | $respStr$bodySuffix",
+                                                                      "🌐 [FP-OkHttp.resp] code=$code | $respStr$errDetails",
                                                                       null,
                                                                       syncDiskImmediately = (code >= 400)
                                                                   )
@@ -928,6 +955,45 @@ jobs:
                                   if (seenDnsHosts.add(lower)) {
                                       captureLog("INFO", MODULE_TAG, "🌐 [DNS] $host", null)
                                   }
+                              }
+                          })
+                      }
+                  }
+              }
+
+              private val playIntegrityDiagHooked = AtomicBoolean(false)
+              private val apkPathDiagLogged = AtomicBoolean(false)
+
+              private fun setupPlayIntegrityDiagnostics(classLoader: ClassLoader) {
+                  if (apkPathDiagLogged.get() == false) {
+                      runCatching {
+                          val ctx = resolveContext()
+                          if (ctx != null && apkPathDiagLogged.compareAndSet(false, true)) {
+                              val splits = ctx.applicationInfo?.splitSourceDirs?.joinToString(", ") ?: "none"
+                              captureLog("HOOK", MODULE_TAG, "🔍 [Diag] apk=${ctx.packageCodePath} | splits=$splits", null)
+                          }
+                      }
+                  }
+                  if (!playIntegrityDiagHooked.compareAndSet(false, true)) return
+                  for (clsName in listOf(
+                      "com.google.android.play.core.integrity.IntegrityManager",
+                      "com.google.android.play.core.integrity.StandardIntegrityManager",
+                      "com.google.android.play.core.integrity.IntegrityManagerFactory"
+                  )) {
+                      runCatching {
+                          val cls = XposedHelpers.findClassIfExists(clsName, classLoader) ?: return@runCatching
+                          captureLog("HOOK", MODULE_TAG, "🔍 [Diag] تم رصد فئة Play Integrity: $clsName", null)
+                      }
+                  }
+                  // مراقبة إنشاء IntegrityTokenRequest أو استدعاء IntegrityServiceException
+                  runCatching {
+                      val exCls = XposedHelpers.findClassIfExists("com.google.android.play.core.integrity.IntegrityServiceException", classLoader)
+                          ?: XposedHelpers.findClassIfExists("com.google.android.play.core.integrity.StandardIntegrityException", classLoader)
+                      if (exCls != null) {
+                          XposedBridge.hookAllConstructors(exCls, object : XC_MethodHook() {
+                              override fun afterHookedMethod(param: MethodHookParam) {
+                                  val err = param.thisObject as? Throwable
+                                  captureLog("ERROR", MODULE_TAG, "🚨 [PlayIntegrity Error] ${err?.message}", err, syncDiskImmediately = true)
                               }
                           })
                       }
