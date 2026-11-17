@@ -132,11 +132,15 @@ jobs:
           import android.content.Intent
           import android.content.pm.ApplicationInfo
           import android.content.pm.PackageInfo
+          import android.content.pm.PackageManager
           import android.location.Location
           import android.os.BaseBundle
+          import android.os.Build
           import android.os.Bundle
+          import android.os.Debug
           import android.os.Looper
           import android.os.Process
+          import android.widget.TextView
           import android.provider.Settings
           import android.util.Log
           import de.robv.android.xposed.IXposedHookLoadPackage
@@ -320,6 +324,9 @@ jobs:
               private val integrityHooked = AtomicBoolean(false)
               private val coroutineIntegrityHooked = AtomicBoolean(false)
               private val rootFilesHooked = AtomicBoolean(false)
+              private val antiDebugHooked = AtomicBoolean(false)
+              private val diagnosticHooked = AtomicBoolean(false)
+              private val ial403Logged = AtomicBoolean(false)
               private fun setupIntegrityHooks(lpparam: XC_LoadPackage.LoadPackageParam) {
                   val classLoader = resolveContext()?.classLoader ?: lpparam.classLoader ?: return
 
@@ -393,6 +400,109 @@ jobs:
                                   }
                               }
                           })
+                      }
+                  }
+
+                  // 3. إخفاء علامات التصحيح وخصائص النظام و Xposed لتفادي رفض IAL403
+                  if (antiDebugHooked.compareAndSet(false, true)) {
+                      runCatching {
+                          XposedHelpers.findAndHookMethod(Debug::class.java, "isDebuggerConnected", object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  param.result = false
+                              }
+                          })
+                          XposedHelpers.findAndHookMethod(Debug::class.java, "waitingForDebugger", object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  param.result = false
+                              }
+                          })
+                      }
+                      runCatching {
+                          val sysProps = XposedHelpers.findClassIfExists("android.os.SystemProperties", classLoader)
+                          if (sysProps != null) {
+                              XposedBridge.hookAllMethods(sysProps, "get", object : XC_MethodHook() {
+                                  override fun beforeHookedMethod(param: MethodHookParam) {
+                                      val key = param.args.firstOrNull() as? String ?: return
+                                      when (key) {
+                                          "ro.debuggable" -> param.result = "0"
+                                          "ro.secure" -> param.result = "1"
+                                          "ro.build.tags" -> param.result = "release-keys"
+                                          "ro.build.type" -> param.result = "user"
+                                          "service.adb.root" -> param.result = "0"
+                                          "ro.boot.verifiedbootstate" -> param.result = "green"
+                                          "ro.boot.flash.locked" -> param.result = "1"
+                                      }
+                                  }
+                              })
+                          }
+                      }
+                      runCatching {
+                          XposedHelpers.findAndHookMethod(Class::class.java, "forName", String::class.java, object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  val name = param.args[0] as? String ?: return
+                                  if (name.startsWith("de.robv.android.xposed") ||
+                                      name.contains("lspatch", ignoreCase = true) ||
+                                      name.contains("lsposed", ignoreCase = true)
+                                  ) {
+                                      param.throwable = ClassNotFoundException(name)
+                                  }
+                              }
+                          })
+                      }
+                  }
+
+                  // 4. مراقب تشخيصي لرسائل IAL403 واستجابات الشبكة 403
+                  if (diagnosticHooked.compareAndSet(false, true)) {
+                      runCatching {
+                          XposedHelpers.findAndHookMethod(
+                              TextView::class.java,
+                              "setText",
+                              CharSequence::class.java,
+                              TextView.BufferType::class.java,
+                              object : XC_MethodHook() {
+                                  override fun beforeHookedMethod(param: MethodHookParam) {
+                                      val cs = param.args[0] as? CharSequence ?: return
+                                      if (cs.contains("IAL403", ignoreCase = true) && ial403Logged.compareAndSet(false, true)) {
+                                          captureLog(
+                                              "HOOK",
+                                              MODULE_TAG,
+                                              "🚨 تم رصد ظهور IAL403 في الواجهة: $cs",
+                                              Throwable("IAL403_UI_TRACE"),
+                                              syncDiskImmediately = true
+                                          )
+                                      }
+                                  }
+                              }
+                          )
+                      }
+                      runCatching {
+                          val realCallCls = XposedHelpers.findClassIfExists("okhttp3.internal.connection.RealCall", classLoader)
+                              ?: XposedHelpers.findClassIfExists("okhttp3.RealCall", classLoader)
+                          if (realCallCls != null) {
+                              val hookCb = object : XC_MethodHook() {
+                                  override fun afterHookedMethod(param: MethodHookParam) {
+                                      val resp = param.result ?: return
+                                      val code = runCatching { XposedHelpers.callMethod(resp, "code") as? Int }.getOrNull() ?: return
+                                      val req = runCatching { XposedHelpers.callMethod(resp, "request") }.getOrNull() ?: return
+                                      val url = runCatching { XposedHelpers.callMethod(req, "url")?.toString() }.getOrNull() ?: ""
+                                      if (code == 403 || code == 401 || url.contains("login", true) || url.contains("auth", true) || url.contains("integrity", true)) {
+                                          val bodyPreview = runCatching {
+                                              val peek = XposedHelpers.callMethod(resp, "peekBody", 2048L)
+                                              XposedHelpers.callMethod(peek, "string") as? String
+                                          }.getOrNull() ?: ""
+                                          captureLog(
+                                              if (code == 403) "ERROR" else "INFO",
+                                              MODULE_TAG,
+                                              "🌐 HTTP $code -> $url | body=$bodyPreview",
+                                              null,
+                                              syncDiskImmediately = (code == 403)
+                                          )
+                                      }
+                                  }
+                              }
+                              XposedBridge.hookAllMethods(realCallCls, "getResponseWithInterceptorChain\$okhttp", hookCb)
+                              XposedBridge.hookAllMethods(realCallCls, "getResponseWithInterceptorChain", hookCb)
+                          }
                       }
                   }
               }
@@ -733,7 +843,50 @@ jobs:
                                   }
                               }
                           })
+                          XposedBridge.hookAllMethods(apmClass, "getInstallerPackageName", object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  val pkg = param.args.firstOrNull() as? String ?: return
+                                  if (pkg == TARGET_PACKAGE) {
+                                      param.result = "com.android.vending"
+                                  }
+                              }
+                          })
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                              XposedBridge.hookAllMethods(apmClass, "getInstallSourceInfo", object : XC_MethodHook() {
+                                  override fun afterHookedMethod(param: MethodHookParam) {
+                                      val pkg = param.args.firstOrNull() as? String ?: return
+                                      if (pkg == TARGET_PACKAGE) {
+                                          val info = param.result ?: return
+                                          runCatching { XposedHelpers.setObjectField(info, "mInitiatingPackageName", "com.android.vending") }
+                                          runCatching { XposedHelpers.setObjectField(info, "mInstallingPackageName", "com.android.vending") }
+                                          runCatching { XposedHelpers.setObjectField(info, "mOriginatingPackageName", "com.android.vending") }
+                                      }
+                                  }
+                              })
+                          }
+                          XposedBridge.hookAllMethods(apmClass, "getApplicationInfo", object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  val pkg = param.args.firstOrNull() as? String ?: return
+                                  val lower = pkg.lowercase(Locale.ROOT)
+                                  if (pkg != TARGET_PACKAGE && pkg != "com.google.android.gms" && SUSPICIOUS_PACKAGE_KEYWORDS.any { lower.contains(it) }) {
+                                      param.throwable = PackageManager.NameNotFoundException(pkg)
+                                  }
+                              }
+                              override fun afterHookedMethod(param: MethodHookParam) {
+                                  val appInfo = param.result as? ApplicationInfo ?: return
+                                  if (appInfo.packageName == TARGET_PACKAGE) {
+                                      appInfo.flags = appInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE.inv()
+                                  }
+                              }
+                          })
                           XposedBridge.hookAllMethods(apmClass, "getPackageInfo", object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  val pkg = param.args.firstOrNull() as? String ?: return
+                                  val lower = pkg.lowercase(Locale.ROOT)
+                                  if (pkg != TARGET_PACKAGE && pkg != "com.google.android.gms" && SUSPICIOUS_PACKAGE_KEYWORDS.any { lower.contains(it) }) {
+                                      param.throwable = PackageManager.NameNotFoundException(pkg)
+                                  }
+                              }
                               override fun afterHookedMethod(param: MethodHookParam) {
                                   val pkgInfo = param.result as? PackageInfo ?: return
                                   val pkg = pkgInfo.packageName ?: return
@@ -741,7 +894,7 @@ jobs:
                                       @Suppress("DEPRECATION")
                                       if (pkgInfo.versionCode in 1..264431034) {
                                           pkgInfo.versionCode = 264431035
-                                          if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                                               pkgInfo.longVersionCode = 264431035L
                                           }
                                       }
