@@ -780,10 +780,81 @@ jobs:
                                       }
                                   }
                               })
+                              val hookedFpCallbacks = Collections.synchronizedSet(HashSet<Class<*>>())
+                              fun extractUrlHint(obj: Any?): String {
+                                  if (obj == null) return ""
+                                  val s = runCatching { obj.toString() }.getOrNull() ?: ""
+                                  if (s.contains("http", true)) return s
+                                  return runCatching {
+                                      for (f in obj.javaClass.declaredFields) {
+                                          f.isAccessible = true
+                                          val v = f.get(obj) ?: continue
+                                          val vs = v.toString()
+                                          if (vs.contains("http", true)) return@runCatching vs
+                                      }
+                                      ""
+                                  }.getOrNull() ?: ""
+                              }
+                              fun extractStatusCode(resp: Any?): Int? {
+                                  if (resp == null) return null
+                                  return runCatching {
+                                      for (f in resp.javaClass.declaredFields) {
+                                          if (f.type == Int::class.javaPrimitiveType) {
+                                              f.isAccessible = true
+                                              val code = f.getInt(resp)
+                                              if (code in 100..599) return@runCatching code
+                                          }
+                                      }
+                                      null
+                                  }.getOrNull()
+                              }
                               XposedBridge.hookAllMethods(fpOkHttp, "enqueue", object : XC_MethodHook() {
                                   override fun beforeHookedMethod(param: MethodHookParam) {
-                                      val callObj = param.args.firstOrNull() ?: return
-                                      captureLog("INFO", MODULE_TAG, "🌐 [FP-OkHttp.enqueue] $callObj", null)
+                                      val callObj = param.args.getOrNull(0)
+                                      val urlHint = extractUrlHint(callObj)
+                                      if (urlHint.isNotEmpty() && shouldLogNetworkUrl(urlHint, 200)) {
+                                          captureLog("INFO", MODULE_TAG, "🌐 [FP-OkHttp.req] $urlHint", null)
+                                      }
+                                      val cbObj = param.args.getOrNull(1) ?: return
+                                      val cbCls = cbObj.javaClass
+                                      if (!hookedFpCallbacks.add(cbCls)) return
+                                      for (m in cbCls.declaredMethods) {
+                                          if (m.parameterCount == 2) {
+                                              val p1 = m.parameterTypes[1]
+                                              if (Throwable::class.java.isAssignableFrom(p1)) {
+                                                  runCatching {
+                                                      XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                                                          override fun beforeHookedMethod(p: MethodHookParam) {
+                                                              val c = p.args.getOrNull(0)
+                                                              val err = p.args.getOrNull(1) as? Throwable
+                                                              val reqHint = extractUrlHint(c)
+                                                              captureLog("ERROR", MODULE_TAG, "🌐 [FP-OkHttp.fail] $reqHint | ${err?.javaClass?.simpleName}: ${err?.message}", err, syncDiskImmediately = true)
+                                                          }
+                                                      })
+                                                  }
+                                              } else if (!p1.isPrimitive) {
+                                                  runCatching {
+                                                      XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                                                          override fun beforeHookedMethod(p: MethodHookParam) {
+                                                              val c = p.args.getOrNull(0)
+                                                              val resp = p.args.getOrNull(1) ?: return
+                                                              val code = extractStatusCode(resp) ?: -1
+                                                              val respStr = extractUrlHint(resp).ifEmpty { extractUrlHint(c) }
+                                                              if (code >= 400 || shouldLogNetworkUrl(respStr, code)) {
+                                                                  captureLog(
+                                                                      if (code >= 400) "ERROR" else "INFO",
+                                                                      MODULE_TAG,
+                                                                      "🌐 [FP-OkHttp.resp] code=$code | $respStr | raw=$resp",
+                                                                      null,
+                                                                      syncDiskImmediately = (code >= 400)
+                                                                  )
+                                                              }
+                                                          }
+                                                      })
+                                                  }
+                                              }
+                                          }
+                                      }
                                   }
                               })
                               captureLog("HOOK", MODULE_TAG, "✅ تم تفعيل خطاف FirebasePerfOkHttpClient")
