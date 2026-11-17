@@ -436,19 +436,6 @@ jobs:
                               })
                           }
                       }
-                      runCatching {
-                          XposedHelpers.findAndHookMethod(Class::class.java, "forName", String::class.java, object : XC_MethodHook() {
-                              override fun beforeHookedMethod(param: MethodHookParam) {
-                                  val name = param.args[0] as? String ?: return
-                                  if (name.startsWith("de.robv.android.xposed") ||
-                                      name.contains("lspatch", ignoreCase = true) ||
-                                      name.contains("lsposed", ignoreCase = true)
-                                  ) {
-                                      param.throwable = ClassNotFoundException(name)
-                                  }
-                              }
-                          })
-                      }
                   }
 
                   // 4. مراقب تشخيصي لرسائل IAL403 واستجابات الشبكة 403
