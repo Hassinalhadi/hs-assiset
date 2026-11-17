@@ -480,6 +480,9 @@ jobs:
 
                   // 4.3 خطاف Cronet الاحتياطي
                   setupCronetHooks(classLoader)
+
+                  // 4.4 خطافات كشف OkHttp المشفر (FirebasePerfOkHttpClient) + WebView + DNS
+                  setupDeepNetworkDiscoveryHooks(classLoader)
               }
 
               private fun shouldLogNetworkUrl(url: String, code: Int): Boolean {
@@ -748,6 +751,98 @@ jobs:
                                   }
                               }
                           )
+                      }
+                  }
+              }
+
+              private val deepDiscoveryHooked = AtomicBoolean(false)
+              private val webViewHooked = AtomicBoolean(false)
+              private val dnsHooked = AtomicBoolean(false)
+              private val seenDnsHosts = Collections.synchronizedSet(HashSet<String>())
+              private val hookedWebClients = Collections.synchronizedSet(HashSet<Class<*>>())
+
+              private fun setupDeepNetworkDiscoveryHooks(classLoader: ClassLoader) {
+                  // 1. FirebasePerfOkHttpClient (يمسك كائن Call حتى لو تم تشفير حزمة okhttp3 بـ R8)
+                  if (deepDiscoveryHooked.compareAndSet(false, true)) {
+                      runCatching {
+                          val fpOkHttp = XposedHelpers.findClassIfExists("com.google.firebase.perf.network.FirebasePerfOkHttpClient", classLoader)
+                          if (fpOkHttp != null) {
+                              XposedBridge.hookAllMethods(fpOkHttp, "execute", object : XC_MethodHook() {
+                                  override fun afterHookedMethod(param: MethodHookParam) {
+                                      val callObj = param.args.firstOrNull()
+                                      val resp = param.result
+                                      val err = param.throwable
+                                      val info = resp?.toString() ?: callObj?.toString() ?: ""
+                                      if (err != null) {
+                                          captureLog("ERROR", MODULE_TAG, "🌐 [FP-OkHttp] Exception: ${err.message} | $info", err, syncDiskImmediately = true)
+                                      } else if (info.contains("code=4") || info.contains("code=5") || info.contains("login", true) || info.contains("auth", true)) {
+                                          captureLog("INFO", MODULE_TAG, "🌐 [FP-OkHttp] $info", null)
+                                      }
+                                  }
+                              })
+                              XposedBridge.hookAllMethods(fpOkHttp, "enqueue", object : XC_MethodHook() {
+                                  override fun beforeHookedMethod(param: MethodHookParam) {
+                                      val callObj = param.args.firstOrNull() ?: return
+                                      captureLog("INFO", MODULE_TAG, "🌐 [FP-OkHttp.enqueue] $callObj", null)
+                                  }
+                              })
+                              captureLog("HOOK", MODULE_TAG, "✅ تم تفعيل خطاف FirebasePerfOkHttpClient")
+                          }
+                      }
+                  }
+
+                  // 2. مراقبة WebView و WebViewClient (إذا كان تسجيل الدخول عبر صفحة ويب)
+                  if (webViewHooked.compareAndSet(false, true)) {
+                      runCatching {
+                          val wvCls = android.webkit.WebView::class.java
+                          XposedHelpers.findAndHookMethod(wvCls, "loadUrl", String::class.java, object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  val url = param.args[0] as? String ?: return
+                                  if (!url.startsWith("javascript:", true)) {
+                                      captureLog("INFO", MODULE_TAG, "🌐 [WebView.loadUrl] $url", null)
+                                  }
+                              }
+                          })
+                          XposedHelpers.findAndHookMethod(wvCls, "setWebViewClient", android.webkit.WebViewClient::class.java, object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  val client = param.args[0] ?: return
+                                  val cls = client.javaClass
+                                  if (!hookedWebClients.add(cls)) return
+                                  runCatching {
+                                      XposedBridge.hookAllMethods(cls, "onReceivedHttpError", object : XC_MethodHook() {
+                                          override fun beforeHookedMethod(p: MethodHookParam) {
+                                              val req = p.args.getOrNull(1) as? android.webkit.WebResourceRequest
+                                              val resp = p.args.getOrNull(2) as? android.webkit.WebResourceResponse
+                                              val url = req?.url?.toString() ?: "unknown"
+                                              val code = resp?.statusCode ?: 0
+                                              captureLog("ERROR", MODULE_TAG, "🌐 [WebView HTTP $code] $url", null, syncDiskImmediately = (code == 403))
+                                          }
+                                      })
+                                  }
+                              }
+                          })
+                      }
+                  }
+
+                  // 3. مراقبة استعلامات DNS لمعرفة النطاقات التي يتصل بها التطبيق
+                  if (dnsHooked.compareAndSet(false, true)) {
+                      runCatching {
+                          XposedHelpers.findAndHookMethod(InetAddress::class.java, "getAllByName", String::class.java, object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  if (isCapturing.get() == true) return
+                                  val host = param.args[0] as? String ?: return
+                                  val lower = host.lowercase(Locale.ROOT)
+                                  if (lower == "127.0.0.1" || lower == "localhost" ||
+                                      lower.contains("braze") || lower.contains("mapbox") ||
+                                      lower.contains("crashlytics") || lower.contains("app-measurement") ||
+                                      lower.contains("doubleclick") || lower.contains("facebook") ||
+                                      lower.contains("appsflyer") || lower.contains("adjust")
+                                  ) return
+                                  if (seenDnsHosts.add(lower)) {
+                                      captureLog("INFO", MODULE_TAG, "🌐 [DNS] $host", null)
+                                  }
+                              }
+                          })
                       }
                   }
               }
