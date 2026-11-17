@@ -313,6 +313,9 @@ jobs:
                                       loadPreviousSessionLogs()
                                       sanitizeIncogniaDatabase(appContext!!)
                                       setupIntegrityHooks(lpparam)
+                                      if (!okhttpHooked.get() && !okhttpClientHooked.get()) {
+                                          captureLog("HOOK", MODULE_TAG, "ℹ️ لم يتم العثور على okhttp3 بالاسم الصريح (غالباً مشفرة بـ R8)")
+                                      }
                                   } catch (_: Throwable) {
                                   }
                               }
@@ -672,16 +675,44 @@ jobs:
                   }
               }
 
+              private val hookedCronetEngineClasses = Collections.synchronizedSet(HashSet<Class<*>>())
+
+              private fun hookConcreteCronetEngine(engineCls: Class<*>) {
+                  if (!hookedCronetEngineClasses.add(engineCls)) return
+                  var count = 0
+                  for (mName in listOf("newUrlRequestBuilder", "createUrlRequestBuilder")) {
+                      runCatching {
+                          val unhooks = XposedBridge.hookAllMethods(engineCls, mName, object : XC_MethodHook() {
+                              override fun beforeHookedMethod(param: MethodHookParam) {
+                                  val cb = param.args.getOrNull(1) ?: return
+                                  hookCronetCallbackClass(cb.javaClass)
+                              }
+                          })
+                          if (unhooks.isNotEmpty()) count += unhooks.size
+                      }
+                  }
+                  if (count > 0) {
+                      captureLog("HOOK", MODULE_TAG, "✅ تم تفعيل خطاف Cronet على ${engineCls.name} ($count دوال)")
+                  }
+              }
+
               private fun setupCronetHooks(classLoader: ClassLoader) {
                   if (!cronetHooked.get()) {
                       var anyHooked = false
-                      for (engineName in listOf("org.chromium.net.CronetEngine", "org.chromium.net.ExperimentalCronetEngine")) {
+                      for (builderName in listOf(
+                          "org.chromium.net.CronetEngine\$Builder",
+                          "org.chromium.net.ExperimentalCronetEngine\$Builder",
+                          "org.chromium.net.ICronetEngineBuilder"
+                      )) {
                           runCatching {
-                              val engineCls = XposedHelpers.findClassIfExists(engineName, classLoader) ?: return@runCatching
-                              val unhooks = XposedBridge.hookAllMethods(engineCls, "newUrlRequestBuilder", object : XC_MethodHook() {
-                                  override fun beforeHookedMethod(param: MethodHookParam) {
-                                      val cb = param.args.getOrNull(1) ?: return
-                                      hookCronetCallbackClass(cb.javaClass)
+                              val builderCls = XposedHelpers.findClassIfExists(builderName, classLoader) ?: return@runCatching
+                              val unhooks = XposedBridge.hookAllMethods(builderCls, "build", object : XC_MethodHook() {
+                                  override fun afterHookedMethod(param: MethodHookParam) {
+                                      val engine = param.result ?: return
+                                      hookConcreteCronetEngine(engine.javaClass)
+                                      engine.javaClass.superclass?.let { sup ->
+                                          if (sup != Any::class.java) hookConcreteCronetEngine(sup)
+                                      }
                                   }
                               })
                               if (unhooks.isNotEmpty()) anyHooked = true
@@ -689,7 +720,7 @@ jobs:
                       }
                       if (anyHooked) {
                           cronetHooked.set(true)
-                          captureLog("HOOK", MODULE_TAG, "✅ تم تفعيل خطاف Cronet (newUrlRequestBuilder) بنجاح")
+                          captureLog("HOOK", MODULE_TAG, "✅ تم تفعيل مراقب CronetEngine.Builder.build()")
                       }
                   }
 
