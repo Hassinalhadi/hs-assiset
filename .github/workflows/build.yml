@@ -325,7 +325,12 @@ jobs:
               private val coroutineIntegrityHooked = AtomicBoolean(false)
               private val rootFilesHooked = AtomicBoolean(false)
               private val antiDebugHooked = AtomicBoolean(false)
-              private val diagnosticHooked = AtomicBoolean(false)
+              private val textViewHooked = AtomicBoolean(false)
+              private val okhttpHooked = AtomicBoolean(false)
+              private val okhttpClientHooked = AtomicBoolean(false)
+              private val httpUrlConnHooked = AtomicBoolean(false)
+              private val cronetHooked = AtomicBoolean(false)
+              private val hookedRuntimeCallClasses = Collections.synchronizedSet(HashSet<Class<*>>())
               private val ial403Logged = AtomicBoolean(false)
               private fun setupIntegrityHooks(lpparam: XC_LoadPackage.LoadPackageParam) {
                   val classLoader = resolveContext()?.classLoader ?: lpparam.classLoader ?: return
@@ -438,8 +443,8 @@ jobs:
                       }
                   }
 
-                  // 4. مراقب تشخيصي لرسائل IAL403 واستجابات الشبكة 403
-                  if (diagnosticHooked.compareAndSet(false, true)) {
+                  // 4. مراقب تشخيصي لرسائل IAL403 واستجابات الشبكة (OkHttp3 + HttpURLConnection + Cronet)
+                  if (textViewHooked.compareAndSet(false, true)) {
                       runCatching {
                           XposedHelpers.findAndHookMethod(
                               TextView::class.java,
@@ -462,33 +467,182 @@ jobs:
                               }
                           )
                       }
+                  }
+
+                  // 4.1 خطاف OkHttp3 (RealCall + OkHttpClient.newCall لاكتشاف الكلاسات المشفرة بـ R8)
+                  setupOkHttpHooks(classLoader)
+
+                  // 4.2 خطاف HttpURLConnection الاحتياطي
+                  setupHttpUrlConnectionHooks(classLoader)
+
+                  // 4.3 خطاف Cronet الاحتياطي
+                  setupCronetHooks(classLoader)
+              }
+
+              private fun shouldLogNetworkUrl(url: String, code: Int): Boolean {
+                  if (code >= 400 || code < 0) return true
+                  val lower = url.lowercase(Locale.ROOT)
+                  if (lower.contains(".png") || lower.contains(".jpg") || lower.contains(".jpeg") ||
+                      lower.contains(".webp") || lower.contains(".svg") || lower.contains(".css") ||
+                      lower.contains(".js") || lower.contains("google-analytics") ||
+                      lower.contains("app-measurement") || lower.contains("crashlytics") ||
+                      lower.contains("braze") || lower.contains("mapbox") ||
+                      lower.contains("appsflyer") || lower.contains("adjust.com") ||
+                      lower.contains("doubleclick") || lower.contains("facebook.com")
+                  ) {
+                      return false
+                  }
+                  return lower.contains("hungerstation") || lower.contains("deliveryhero") ||
+                      lower.contains("roadrunner") || lower.contains("login") ||
+                      lower.contains("auth") || lower.contains("token") ||
+                      lower.contains("otp") || lower.contains("session") ||
+                      lower.contains("integrity") || lower.contains("verify") ||
+                      lower.contains("incognia") || lower.contains("rider")
+              }
+
+              private fun logOkHttpResponseOrError(param: XC_MethodHook.MethodHookParam, sourceName: String) {
+                  try {
+                      if (param.throwable != null) {
+                          val callObj = param.thisObject
+                          val req = runCatching { XposedHelpers.callMethod(callObj, "request") }.getOrNull()
+                          val url = runCatching { XposedHelpers.callMethod(req, "url")?.toString() }.getOrNull() ?: "unknown"
+                          captureLog(
+                              "ERROR",
+                              MODULE_TAG,
+                              "🌐 [$sourceName] Exception -> $url | ${param.throwable.javaClass.simpleName}: ${param.throwable.message}",
+                              param.throwable,
+                              syncDiskImmediately = true
+                          )
+                          return
+                      }
+                      val resp = param.result ?: return
+                      val code = runCatching { XposedHelpers.callMethod(resp, "code") as? Int }.getOrNull() ?: return
+                      val req = runCatching { XposedHelpers.callMethod(resp, "request") }.getOrNull() ?: return
+                      val url = runCatching { XposedHelpers.callMethod(req, "url")?.toString() }.getOrNull() ?: ""
+                      if (shouldLogNetworkUrl(url, code)) {
+                          val bodyPreview = runCatching {
+                              val peek = XposedHelpers.callMethod(resp, "peekBody", 2048L)
+                              XposedHelpers.callMethod(peek, "string") as? String
+                          }.getOrNull() ?: ""
+                          val level = if (code >= 400) "ERROR" else "INFO"
+                          captureLog(
+                              level,
+                              MODULE_TAG,
+                              "🌐 [$sourceName] HTTP $code -> $url | body=$bodyPreview",
+                              null,
+                              syncDiskImmediately = (code >= 400)
+                          )
+                      }
+                  } catch (_: Throwable) {
+                  }
+              }
+
+              private fun hookOkHttpCallClass(callCls: Class<*>, label: String): Boolean {
+                  if (!hookedRuntimeCallClasses.add(callCls)) return true
+                  var hookedCount = 0
+                  val hookCb = object : XC_MethodHook() {
+                      override fun afterHookedMethod(param: MethodHookParam) {
+                          logOkHttpResponseOrError(param, label)
+                      }
+                  }
+                  for (methodName in listOf("getResponseWithInterceptorChain\$okhttp", "getResponseWithInterceptorChain", "execute")) {
+                      runCatching {
+                          val unhooks = XposedBridge.hookAllMethods(callCls, methodName, hookCb)
+                          if (unhooks.isNotEmpty()) hookedCount += unhooks.size
+                      }
+                  }
+                  if (hookedCount > 0) {
+                      captureLog("HOOK", MODULE_TAG, "✅ تم تفعيل خطاف OkHttp على ${callCls.name} ($hookedCount دوال)")
+                      return true
+                  }
+                  return false
+              }
+
+              private fun setupOkHttpHooks(classLoader: ClassLoader) {
+                  if (!okhttpHooked.get()) {
                       runCatching {
                           val realCallCls = XposedHelpers.findClassIfExists("okhttp3.internal.connection.RealCall", classLoader)
                               ?: XposedHelpers.findClassIfExists("okhttp3.RealCall", classLoader)
-                          if (realCallCls != null) {
-                              val hookCb = object : XC_MethodHook() {
+                          if (realCallCls != null && hookOkHttpCallClass(realCallCls, "OkHttp")) {
+                              okhttpHooked.set(true)
+                          }
+                      }
+                  }
+                  if (!okhttpClientHooked.get()) {
+                      runCatching {
+                          val clientCls = XposedHelpers.findClassIfExists("okhttp3.OkHttpClient", classLoader)
+                          if (clientCls != null) {
+                              val unhooks = XposedBridge.hookAllMethods(clientCls, "newCall", object : XC_MethodHook() {
                                   override fun afterHookedMethod(param: MethodHookParam) {
-                                      val resp = param.result ?: return
-                                      val code = runCatching { XposedHelpers.callMethod(resp, "code") as? Int }.getOrNull() ?: return
-                                      val req = runCatching { XposedHelpers.callMethod(resp, "request") }.getOrNull() ?: return
-                                      val url = runCatching { XposedHelpers.callMethod(req, "url")?.toString() }.getOrNull() ?: ""
-                                      if (code == 403 || code == 401 || url.contains("login", true) || url.contains("auth", true) || url.contains("integrity", true)) {
-                                          val bodyPreview = runCatching {
-                                              val peek = XposedHelpers.callMethod(resp, "peekBody", 2048L)
-                                              XposedHelpers.callMethod(peek, "string") as? String
-                                          }.getOrNull() ?: ""
-                                          captureLog(
-                                              if (code == 403) "ERROR" else "INFO",
-                                              MODULE_TAG,
-                                              "🌐 HTTP $code -> $url | body=$bodyPreview",
-                                              null,
-                                              syncDiskImmediately = (code == 403)
-                                          )
-                                      }
+                                      val callObj = param.result ?: return
+                                      hookOkHttpCallClass(callObj.javaClass, "OkHttp-Runtime")
+                                  }
+                              })
+                              if (unhooks.isNotEmpty()) {
+                                  okhttpClientHooked.set(true)
+                                  captureLog("HOOK", MODULE_TAG, "✅ تم تفعيل خطاف OkHttpClient.newCall بنجاح")
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private fun setupHttpUrlConnectionHooks(classLoader: ClassLoader) {
+                  if (httpUrlConnHooked.get()) return
+                  val candidates = listOf(
+                      "com.android.okhttp.internal.huc.HttpURLConnectionImpl",
+                      "com.android.okhttp.internal.huc.DelegatingHttpsURLConnection",
+                      "java.net.HttpURLConnection"
+                  )
+                  var anyHooked = false
+                  for (clsName in candidates) {
+                      runCatching {
+                          val cls = XposedHelpers.findClassIfExists(clsName, classLoader) ?: return@runCatching
+                          val unhooks = XposedBridge.hookAllMethods(cls, "getResponseCode", object : XC_MethodHook() {
+                              override fun afterHookedMethod(param: MethodHookParam) {
+                                  if (isCapturing.get() == true) return
+                                  val conn = param.thisObject as? java.net.HttpURLConnection ?: return
+                                  val url = conn.url?.toString() ?: ""
+                                  if (param.throwable != null) {
+                                      captureLog(
+                                          "ERROR",
+                                          MODULE_TAG,
+                                          "🌐 [HttpURLConnection] Exception -> $url | ${param.throwable.message}",
+                                          param.throwable,
+                                          syncDiskImmediately = true
+                                      )
+                                      return
+                                  }
+                                  val code = param.result as? Int ?: return
+                                  if (shouldLogNetworkUrl(url, code)) {
+                                      captureLog(
+                                          if (code >= 400) "ERROR" else "INFO",
+                                          MODULE_TAG,
+                                          "🌐 [HttpURLConnection] HTTP $code -> $url",
+                                          null,
+                                          syncDiskImmediately = (code >= 400)
+                                      )
                                   }
                               }
-                              XposedBridge.hookAllMethods(realCallCls, "getResponseWithInterceptorChain\$okhttp", hookCb)
-                              XposedBridge.hookAllMethods(realCallCls, "getResponseWithInterceptorChain", hookCb)
+                          })
+                          if (unhooks.isNotEmpty()) anyHooked = true
+                      }
+                  }
+                  if (anyHooked) {
+                      httpUrlConnHooked.set(true)
+                  }
+              }
+
+              private fun setupCronetHooks(classLoader: ClassLoader) {
+                  if (cronetHooked.get()) return
+                  runCatching {
+                      val cronetReqCls = XposedHelpers.findClassIfExists("org.chromium.net.impl.CronetUrlRequest", classLoader)
+                          ?: XposedHelpers.findClassIfExists("org.chromium.net.UrlRequest", classLoader)
+                      if (cronetReqCls != null) {
+                          val cbCls = XposedHelpers.findClassIfExists("org.chromium.net.UrlRequest\$Callback", classLoader)
+                          if (cbCls != null) {
+                              cronetHooked.set(true)
+                              captureLog("HOOK", MODULE_TAG, "ℹ️ تم رصد فئة Cronet (${cronetReqCls.name})")
                           }
                       }
                   }
