@@ -1060,19 +1060,8 @@ jobs:
                       "unmockgps"
                   )
 
-                  // 1. منع كشف كلاسات Xposed/LSPatch عبر Class.forName و ClassLoader.loadClass
+                  // 1. منع كشف كلاسات Xposed/LSPatch عبر ClassLoader.loadClass فقط (تجنب Class.forName لأنه يعتمد على VMStack.getCallingClassLoader)
                   if (classHideHooked.compareAndSet(false, true)) {
-                      runCatching {
-                          XposedBridge.hookAllMethods(Class::class.java, "forName", object : XC_MethodHook() {
-                              override fun beforeHookedMethod(param: MethodHookParam) {
-                                  if (isSelfClassLookup.get() == true || isCapturing.get() == true) return
-                                  val name = (param.args.firstOrNull() as? String)?.lowercase(Locale.ROOT) ?: return
-                                  if (hiddenKeywords.any { name.contains(it) }) {
-                                      param.throwable = ClassNotFoundException(name)
-                                  }
-                              }
-                          })
-                      }
                       runCatching {
                           XposedHelpers.findAndHookMethod(
                               ClassLoader::class.java,
